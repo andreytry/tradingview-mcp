@@ -370,7 +370,14 @@ for (const [sym, tick, pv, label] of SYMS) {
       const [t, o, h, l, c] = m1[j];
       const hitS = isLong ? l <= stop : h >= stop;
       const hitT = isLong ? h >= tp : l <= tp;
-      if (hitS && hitT) { res = Math.abs(o - tp) < Math.abs(o - stop) ? 'TARGET' : 'STOP'; exitT = t; break; }
+      // Same-bar ambiguity. With 1m exit bars, nearest-to-open is a fair guess. When the
+      // exit series is coarser (5m), that guess flatters the result, so PESSIMISTIC_TIE
+      // forces the stop and the number becomes a floor rather than an estimate.
+      if (hitS && hitT) {
+        res = process.env.PESSIMISTIC_TIE === '1' ? 'STOP'
+            : (Math.abs(o - tp) < Math.abs(o - stop) ? 'TARGET' : 'STOP');
+        exitT = t; break;
+      }
       if (hitS) { res = 'STOP'; exitT = t; break; }
       if (hitT) { res = 'TARGET'; exitT = t; break; }
     }

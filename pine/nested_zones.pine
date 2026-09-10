@@ -2,7 +2,9 @@
 // NestedZones v1 — Nested Supply & Demand, indexes + gold.
 //
 // Backtested 2026-03-06 -> 2026-09-04 on MNQ/MES/MYM/M2K/MGC 5m (Databento GLBX.MDP3,
-// volume-rolled continuous): n=115, 60.9% win, avg R +0.507, PF 2.23, t=4.77.
+// volume-rolled continuous): n=88, 48.9% win, avg R +0.393, PF 1.73, t=2.47.
+// Supersedes an earlier n=115 / PF 2.23 / t=4.77 figure, which counted 33 setups whose
+// stop sat on the profitable side of entry. See the stopSideOK guard below.
 //
 // EVERY signal is emitted. The script does not decide what is worth sending — it captures
 // all of them and posts to /capture, where they wait for a manual checklist review before
@@ -194,7 +196,13 @@ if barstate.isconfirmed and dir != 0 and array.size(zones) > 0 and strategy.posi
                 float e  = close
                 float sl = math.round((z.dem ? z.dist - slZoneFrac * zw : z.dist + slZoneFrac * zw) / syminfo.mintick) * syminfo.mintick
                 float R  = math.abs(e - sl)
-                if R >= 2 * syminfo.mintick
+                // The stop must sit beyond the zone on the LOSING side of the trade. Once
+                // price has traded through the whole zone, 30%-beyond-distal lands the stop
+                // on the profitable side of entry, which is not a trade. The backtest took
+                // 33 of 169 setups with this geometry and they averaged +0.857R against
+                // +0.148R for the rest, inflating every published number.
+                bool stopSideOK = z.dem ? sl < e : sl > e
+                if stopSideOK and R >= 2 * syminfo.mintick
                     float tp = math.round((z.dem ? e + targetR * R : e - targetR * R) / syminfo.mintick) * syminfo.mintick
                     if z.dem
                         strategy.entry("NZ-L", strategy.long)

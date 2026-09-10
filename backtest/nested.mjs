@@ -333,6 +333,13 @@ for (const [sym, tick, pv, label] of SYMS) {
     if (!(zw > 0)) continue;
     const entry = b.close;
     const stop = z.dem ? R2(z.ltf.distal - P.SL_ZONE_FRAC * zw) : R2(z.ltf.distal + P.SL_ZONE_FRAC * zw);
+    // The stop MUST sit beyond the zone on the losing side of the trade. If price has
+    // already traded through the whole zone, the 30%-beyond-distal rule puts the stop on
+    // the PROFITABLE side of entry, which is not a trade at all — and the exit resolver
+    // then scores those stop-outs as wins. 33 of 169 trades were built this way and they
+    // averaged +0.857R against +0.148R for the rest, so they inflated every published
+    // zones statistic. Reject the geometry instead of trading it.
+    if (z.dem ? !(stop < entry) : !(stop > entry)) continue;
     const R = Math.abs(entry - stop);
     if (!(R > 0) || R < 2 * tick) continue;
     F.zw++;

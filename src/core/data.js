@@ -630,3 +630,93 @@ export async function getPineBoxes({ study_filter, verbose } = {}) {
   });
   return { success: true, study_count: studies.length, studies };
 }
+
+/**
+ * Bulk-export the chart's loaded bar buffer to a file on disk.
+ *
+ * getOhlcv() is capped at MAX_OHLCV_BARS because its result travels back through the
+ * tool channel. A backtest needs tens of thousands of bars, which is not a context
+ * problem to solve by chunking the reply — the data should never enter the transcript at
+ * all. This writes straight to disk and returns only a receipt.
+ *
+ * Reading is chunked inside the page because serialising 200k bars across CDP in one
+ * evaluate() call overflows the message buffer and returns null with no error.
+ */
+export async function exportBars({ symbol, timeframe, from, to, out, chunk = 2000, _deps } = {}) {
+  const { setSymbol, setTimeframe, setVisibleRange } = await import('./chart.js');
+  const { writeFileSync, mkdirSync } = await import('node:fs');
+  const { dirname } = await import('node:path');
+
+  if (!out) throw new Error('exportBars requires an output path');
+
+  if (symbol) { await setSymbol({ symbol, _deps }); await new Promise((r) => setTimeout(r, 3000)); }
+  if (timeframe) { await setTimeframe({ timeframe, _deps }); await new Promise((r) => setTimeout(r, 3000)); }
+
+  // Setting the visible range is what forces TradingView to page history in. One call is
+  // not enough: the feed answers with a single page (~45 days on 5m) and stops. Keep
+  // asking for the window that ends at the oldest bar currently held until the buffer
+  // reaches `from` or stops growing, which is how the UI behaves when scrolled left.
+  if (from && to) {
+    await setVisibleRange({ from, to, _deps });
+    await new Promise((r) => setTimeout(r, 8000));
+
+    let previous = -1;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const edge = await evaluate(`
+        (function() {
+          var b = ${BARS_PATH};
+          if (!b || typeof b.firstIndex !== 'function') return null;
+          var v = b.valueAt(b.firstIndex());
+          return v ? { time: v[0], size: b.size() } : null;
+        })()
+      `);
+      if (!edge) break;
+      if (edge.time <= from) break;
+      if (edge.size === previous) break;   // feed has nothing older to give
+      previous = edge.size;
+      await setVisibleRange({ from, to: edge.time, _deps });
+      await new Promise((r) => setTimeout(r, 4000));
+    }
+  }
+
+  await waitForChartReady().catch(() => {});
+
+  const span = await evaluate(`
+    (function() {
+      var b = ${BARS_PATH};
+      if (!b || typeof b.firstIndex !== 'function') return null;
+      return { first: b.firstIndex(), last: b.lastIndex(), size: b.size() };
+    })()
+  `);
+  if (!span) throw new Error('Could not reach the chart bar buffer.');
+
+  const bars = [];
+  for (let i = span.first; i <= span.last; i += chunk) {
+    const j = Math.min(i + chunk - 1, span.last);
+    const part = await evaluate(`
+      (function() {
+        var b = ${BARS_PATH}, o = [];
+        for (var i = ${i}; i <= ${j}; i++) {
+          var v = b.valueAt(i);
+          if (v) o.push([v[0], v[1], v[2], v[3], v[4], v[5] || 0]);
+        }
+        return o;
+      })()
+    `);
+    if (Array.isArray(part)) bars.push(...part);
+  }
+
+  if (!bars.length) throw new Error('Chart bar buffer is empty — history may still be loading.');
+  bars.sort((a, b) => a[0] - b[0]);
+
+  mkdirSync(dirname(out), { recursive: true });
+  writeFileSync(out, JSON.stringify(bars));
+
+  const days = new Set(bars.map((b) => Math.floor(b[0] / 86400))).size;
+  return {
+    success: true, path: out, bars: bars.length,
+    first: new Date(bars[0][0] * 1000).toISOString(),
+    last: new Date(bars[bars.length - 1][0] * 1000).toISOString(),
+    days, per_day: Math.round(bars.length / days),
+  };
+}

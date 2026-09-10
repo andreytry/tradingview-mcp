@@ -18,6 +18,23 @@ register('ohlcv', {
   }),
 });
 
+register('export-bars', {
+  description: 'Bulk-export the loaded bar buffer to a file (for backtests)',
+  options: {
+    symbol: { type: 'string', description: 'Symbol to switch to first' },
+    timeframe: { type: 'string', description: 'Resolution, e.g. 1 or 5' },
+    from: { type: 'string', description: 'Visible-range start (unix seconds) — forces history to load' },
+    to: { type: 'string', description: 'Visible-range end (unix seconds)' },
+    out: { type: 'string', description: 'Output file path' },
+  },
+  handler: (opts) => core.exportBars({
+    symbol: opts.symbol, timeframe: opts.timeframe,
+    from: opts.from ? Number(opts.from) : undefined,
+    to: opts.to ? Number(opts.to) : undefined,
+    out: opts.out,
+  }),
+});
+
 register('values', {
   description: 'Get current indicator values from data window',
   handler: () => core.getStudyValues(),

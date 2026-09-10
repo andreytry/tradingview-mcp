@@ -11,6 +11,17 @@ export function registerDataTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
+  server.tool('data_export_bars', 'Bulk-export the chart bar buffer to a FILE on disk and return only a receipt (path, bar count, date span). Use this instead of data_get_ohlcv whenever you need more than 500 bars, e.g. to feed a backtest — the bars never enter the conversation.', {
+    symbol: z.string().optional().describe('Symbol to switch to first, e.g. "CME:6B1!"'),
+    timeframe: z.string().optional().describe('Resolution, e.g. "1" or "5"'),
+    from: z.coerce.number().optional().describe('Visible-range start, unix seconds. Setting a range is what forces TradingView to page history in.'),
+    to: z.coerce.number().optional().describe('Visible-range end, unix seconds'),
+    out: z.string().describe('Output file path'),
+  }, async (args) => {
+    try { return jsonResult(await core.exportBars(args)); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
   server.tool('data_get_indicator', 'Get indicator/study info and input values', {
     entity_id: z.string().describe('Study entity ID (from chart_get_state)'),
   }, async ({ entity_id }) => {

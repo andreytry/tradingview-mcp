@@ -43,6 +43,15 @@ markTrades = input.bool(true, "Draw the open position", group=grpM)
 colRisk    = input.color(color.new(#f23645, 72), "Risk box", group=grpM)
 colReward  = input.color(color.new(#089981, 72), "Reward box", group=grpM)
 
+grpV = "Variant"
+// Declared LAST on purpose: inputs are numbered by declaration order, and the webhook
+// secret sits at in_12. Inserting anywhere earlier would renumber it and silently break
+// every armed alert. A TradingView alert snapshots input values when it is created, so
+// arming one pass with this on and another with it off gives two independent strategies
+// from a single script — and each signal names which one it came from.
+requireNesting = input.bool(true, "Require the base to sit inside an HTF base", group=grpV,
+     tooltip="On  = nested-zones-v1: n=88, avg R +0.393, PF 1.73.\nOff = single-zones-v1: n=147, avg R +0.046, PF 1.07.")
+
 f_num(float x) => str.tostring(x, "#.########")
 bodyOf(float o, float c) => math.abs(c - o)
 
@@ -179,14 +188,16 @@ if barstate.isconfirmed and array.size(zones) > 0
 var box mRisk = na
 var box mReward = na
 
-if barstate.isconfirmed and dir != 0 and array.size(zones) > 0 and strategy.position_size == 0 and not na(hTop)
+if barstate.isconfirmed and dir != 0 and array.size(zones) > 0 and strategy.position_size == 0 and (not requireNesting or not na(hTop))
     for i = array.size(zones) - 1 to 0
         Zone z = array.get(zones, i)
         bool aligned = z.dem ? dir == 1 : dir == -1
-        bool nested = z.top <= hTop and z.bot >= hBot and z.dem == hDem
+        bool nested = not requireNesting or (z.top <= hTop and z.bot >= hBot and z.dem == hDem)
+        // Nested: the pocket spans the HTF distal edge to the LTF proximal edge.
+        // Single: there is no outer zone, so the pocket is the zone body.
         float hDist = z.dem ? hBot : hTop
-        float pLo = math.min(hDist, z.prox)
-        float pHi = math.max(hDist, z.prox)
+        float pLo = requireNesting ? math.min(hDist, z.prox) : math.min(z.prox, z.dist)
+        float pHi = requireNesting ? math.max(hDist, z.prox) : math.max(z.prox, z.dist)
         bool inPocket = low <= pHi and high >= pLo
         bool rsiOK = z.dem ? rsiv < rsiLongMax : rsiv > rsiShortMin
         string rk = rejKind(z.dem)
@@ -219,7 +230,7 @@ if barstate.isconfirmed and dir != 0 and array.size(zones) > 0 and strategy.posi
                         mReward := box.new(time, e, time, tp, xloc=xloc.bar_time, bgcolor=colReward, border_color=#089981)
                     z.fresh := false
                     string msg = '{"v":1,"secret":"' + webhook_secret +
-                      '","strategy":"nested-zones-v1"' +
+                      '","strategy":"' + (requireNesting ? "nested-zones-v1" : "single-zones-v1") + '"' +
                       ',"id":"'     + syminfo.ticker + '-' + str.tostring(time) + '"' +
                       ',"symbol":"' + syminfo.ticker + '"' +
                       ',"side":"'   + (z.dem ? "LONG" : "SHORT") + '"' +
@@ -244,7 +255,7 @@ if barstate.isconfirmed and dir != 0 and array.size(zones) > 0 and strategy.posi
                       ',"rr":'      + f_num(targetR) +
                       ',"zone_top":' + f_num(z.top) +
                       ',"zone_bottom":' + f_num(z.bot) +
-                      ',"zone_tf":"5M"' +
+                      ',"zone_tf":"5M","nested":' + (requireNesting ? "true" : "false") + '' +
                       ',"sweep_wick":' + f_num(z.dist) +
                       ',"bar_time":' + str.tostring(time) + '}'
                     alert(msg, alert.freq_once_per_bar_close)

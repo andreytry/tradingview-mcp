@@ -25,9 +25,23 @@ CONTRACTS=(
   "6S:0.00005:125000:Swiss franc"
   "MBT:5:0.1:Bitcoin micro"
   "SIL:0.005:1000:Silver micro"
+  "6E:0.00005:125000:Euro FX"
 )
 
-SYMLIST=$(printf '%s,' "${CONTRACTS[@]%%:*}"); SYMLIST=${SYMLIST%,}
+# A symbol whose volume-rolled series is already on disk and complete is not pulled
+# again. Euro is already there, and Databento bills per pull.
+NEED=()
+for c in "${CONTRACTS[@]}"; do
+  sym=${c%%:*}
+  n=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('backtest-data/${sym}_1m.json')).length)}catch(e){console.log(0)}")
+  if [ "${FORCE_PULL:-0}" = 1 ] || [ "$n" -lt 150000 ]; then NEED+=("$c"); else echo "have $sym ($n bars), skipping pull"; fi
+done
+
+if [ ${#NEED[@]} -eq 0 ]; then
+  echo "all series already on disk; going straight to the regression"
+  PULLED=("${CONTRACTS[@]}")
+else
+SYMLIST=$(printf '%s,' "${NEED[@]%%:*}"); SYMLIST=${SYMLIST%,}
 SYMLIST=$(echo "$SYMLIST" | sed 's/\([A-Z0-9]*\)/\1.v.0/g')
 
 echo "== cost estimate =="
@@ -37,7 +51,7 @@ curl -s -u "$DATABENTO_API_KEY:" https://hist.databento.com/v0/metadata.get_cost
 echo; read -rp "proceed? [y/N] " ok; [ "$ok" = y ] || exit 0
 
 PULLED=()
-for c in "${CONTRACTS[@]}"; do
+for c in "${NEED[@]}"; do
   sym=${c%%:*}
   echo "== $sym =="
   curl -s -u "$DATABENTO_API_KEY:" https://hist.databento.com/v0/timeseries.get_range \
@@ -51,6 +65,11 @@ for c in "${CONTRACTS[@]}"; do
   fi
   node backtest/prep_any.mjs "$sym" && PULLED+=("$c")
 done
+# Anything skipped above is already prepped and belongs in the regression too.
+for c in "${CONTRACTS[@]}"; do
+  case " ${NEED[*]} " in *" $c "*) ;; *) PULLED+=("$c") ;; esac
+done
+fi
 
 [ ${#PULLED[@]} -eq 0 ] && { echo "nothing pulled"; exit 1; }
 

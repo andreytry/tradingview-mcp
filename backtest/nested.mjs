@@ -207,7 +207,12 @@ const SYMS = [
 // regression can run as one command: EXTRA_SYMS='[["6B",0.0001,62500,"British pound"]]'
 // Entries are [symbol, tick, pointValue, label] and need matching _1m/_5m files in D.
 if (process.env.EXTRA_SYMS) {
-  for (const e of JSON.parse(process.env.EXTRA_SYMS)) SYMS.push(e);
+  // Replace rather than append on a name clash. 6E is already in the base list, and a
+  // duplicate entry would run it twice and double-count every one of its trades.
+  for (const e of JSON.parse(process.env.EXTRA_SYMS)) {
+    const at = SYMS.findIndex((x) => x[0] === e[0]);
+    if (at >= 0) SYMS[at] = e; else SYMS.push(e);
+  }
 }
 
 const all = [];

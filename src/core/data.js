@@ -649,7 +649,22 @@ export async function exportBars({ symbol, timeframe, from, to, out, chunk = 200
 
   if (!out) throw new Error('exportBars requires an output path');
 
-  if (symbol) { await setSymbol({ symbol, _deps }); await new Promise((r) => setTimeout(r, 3000)); }
+  if (symbol) {
+    await setSymbol({ symbol, _deps });
+    // Verify the switch actually landed. A fixed sleep is not enough: the read below
+    // takes whatever the chart is showing, so a slow switch silently exports the WRONG
+    // INSTRUMENT with no error. That produced a "MYM" file full of Nasdaq bars.
+    const want = symbol.includes(":") ? symbol.split(":")[1] : symbol;
+    let got = null;
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      got = await evaluate(`(function(){try{return ${CHART_API}._chartWidget.model().mainSeries().symbolInfo().name;}catch(e){return null;}})()`);
+      if (got && String(got).includes(want)) break;
+    }
+    if (!got || !String(got).includes(want)) {
+      throw new Error(`chart did not switch to ${symbol} (still ${got}) — refusing to export the wrong instrument`);
+    }
+  }
   if (timeframe) { await setTimeframe({ timeframe, _deps }); await new Promise((r) => setTimeout(r, 3000)); }
 
   // Setting the visible range is what forces TradingView to page history in. One call is

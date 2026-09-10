@@ -218,7 +218,15 @@ if (process.env.EXTRA_SYMS) {
 const all = [];
 const perSym = [];
 
+// ONLY=MYM,MNQ restricts the run to named symbols — for answering a question about one
+// instrument without waiting for the whole universe.
+const ONLY = process.env.ONLY ? process.env.ONLY.split(',').map((s) => s.trim()) : null;
+const MAX_TOUCHES = Number(process.env.MAX_TOUCHES || 1);
+// ZBAND=29195,29235 reports the life of every zone overlapping that price band.
+const ZBAND = process.env.ZBAND ? process.env.ZBAND.split(',').map(Number) : null;
+
 for (const [sym, tick, pv, label] of SYMS) {
+  if (ONLY && !ONLY.includes(sym)) continue;
   let bars, m1;
   try {
     bars = JSON.parse(readFileSync(`${D}/${sym}_5m.json`));
@@ -288,12 +296,20 @@ for (const [sym, tick, pv, label] of SYMS) {
 
   for (let i = 5; i < ltf.length; i++) {
     const b = ltf[i];
+    // Trace sits at the very top so a bar that exits on the earliest guards still says so.
+    const TRACE0 = process.env.DEBUG_AT && Math.abs(b.time - Number(process.env.DEBUG_AT)) < 1;
+    if (TRACE0) {
+      console.log(`  [trace] ${sym} bar ${new Date(b.time * 1000).toISOString()} O${b.open} H${b.high} L${b.low} C${b.close}`);
+      if (b.time < inTrade) console.log(`  [trace] EXIT: still in a trade until ${new Date(inTrade * 1000).toISOString()}`);
+      if (rollDays.has(et(b.time).date)) console.log(`  [trace] EXIT: ${et(b.time).date} is a contract roll day`);
+    }
     if (b.time < inTrade) continue;
     const day = et(b.time).date;
     if (rollDays.has(day)) continue;
 
     F.bars++;
     const dir = trendAt(trend, b.time);
+    if (TRACE0) console.log(`  [trace] trend=${dir === 1 ? 'UP' : dir === -1 ? 'DOWN' : 'NONE (blocks everything)'}`);
     if (dir === 0) continue;                                   // rule 1
     F.trend++;
 
@@ -306,6 +322,24 @@ for (const [sym, tick, pv, label] of SYMS) {
       && (z.dem ? dir === 1 : dir === -1)
       && b.low <= z.pocketHi && b.high >= z.pocketLo);
     if (nested.some((z) => z.knownTime < b.time && !z.mitigated && (z.dem ? dir === 1 : dir === -1))) F.freshAligned++;
+    if (TRACE0) {
+      const aligned = nested.filter((z) => z.knownTime < b.time && !z.mitigated && (z.dem ? dir === 1 : dir === -1));
+      const stale = nested.filter((z) => z.knownTime < b.time && z.mitigated && (z.dem ? dir === 1 : dir === -1));
+      console.log(`  [trace] nested zones aligned with trend: ${aligned.length} fresh, ${stale.length} already mitigated`);
+      for (const q of aligned.slice(-3)) {
+        console.log(`  [trace]   zone ${q.dem ? 'demand' : 'supply'} pocket ${q.pocketLo}..${q.pocketHi} | this bar L${b.low} H${b.high} -> ${(b.low <= q.pocketHi && b.high >= q.pocketLo) ? 'IN POCKET' : 'not reached'}`);
+      }
+      // Also show zones the engine built near this price regardless of state, so a
+      // disagreement with what is drawn on the chart can be attributed: either the
+      // detector never made a zone there, or it made one and already retired it.
+      const near = nested.filter((q) => q.knownTime < b.time
+        && Math.abs((q.ltf.proximal + q.ltf.distal) / 2 - b.close) < 120);
+      console.log(`  [trace] engine zones within 120pts of ${b.close}: ${near.length}`);
+      for (const q of near) {
+        console.log(`  [trace]   ${q.dem ? 'demand' : 'supply'} ${Math.min(q.ltf.proximal, q.ltf.distal)}..${Math.max(q.ltf.proximal, q.ltf.distal)} ${q.mitigated ? 'MITIGATED' : 'fresh'} aligned=${q.dem ? dir === 1 : dir === -1}`);
+      }
+      if (!cands.length) console.log(`  [trace] EXIT: price never entered the pocket of any fresh aligned zone`);
+    }
     if (!cands.length) continue;
     seen++; F.pocket++;
 
@@ -313,18 +347,41 @@ for (const [sym, tick, pv, label] of SYMS) {
     // now that candidates are chosen, retire every fresh zone this bar traded into
     for (const q of nested) {
       if (q.knownTime > b.time || q.mitigated) continue;
-      if (q.dem ? b.low <= q.ltf.proximal : b.high >= q.ltf.proximal) q.mitigated = true;
+      if (q.dem ? b.low <= q.ltf.proximal : b.high >= q.ltf.proximal) {
+        // MAX_TOUCHES=1 is the spec: a zone dies on first return, on the reasoning that
+        // the unfilled orders that made it are consumed there. Raising it tests whether
+        // a second touch still carries an edge.
+        q.touches = (q.touches ?? 0) + 1;
+        if (ZBAND && Math.min(q.ltf.proximal, q.ltf.distal) <= ZBAND[1] && Math.max(q.ltf.proximal, q.ltf.distal) >= ZBAND[0]) {
+          console.log(`  [zone] touch #${q.touches} at ${new Date(b.time * 1000).toISOString()} on ${q.dem ? 'demand' : 'supply'} ${Math.min(q.ltf.proximal, q.ltf.distal)}..${Math.max(q.ltf.proximal, q.ltf.distal)} (born ${new Date(q.knownTime * 1000).toISOString()})`);
+        }
+        if (q.touches >= MAX_TOUCHES) q.mitigated = true;
+      }
     }
+    // Per-bar gate trace for one timestamp, so a "why did this not trade" question is
+    // answered by the production rules rather than a re-implementation of them.
+    const TRACE = process.env.DEBUG_AT && Math.abs(b.time - Number(process.env.DEBUG_AT)) < 1;
+    if (TRACE) {
+      const aligned = nested.filter((q) => q.knownTime < b.time && !q.mitigated && (q.dem ? dir === 1 : dir === -1));
+      console.log(`  [trace] ${sym} trend=${dir} nestedZones=${nested.length} freshAligned=${aligned.length} inPocket=${cands.length} chosen=${z ? (z.dem ? 'demand/LONG' : 'supply/SHORT') : 'NONE'}`);
+      if (!z && aligned.length) {
+        const q = aligned[aligned.length - 1];
+        console.log(`  [trace] nearest aligned zone: ${q.dem ? 'demand' : 'supply'} prox=${q.ltf.proximal} distal=${q.ltf.distal} | bar H=${b.high} L=${b.low}`);
+      }
+    }
+
     if (!z) continue;
 
     // rule 7: RSI
     const r = rsi[i];
     if (r == null) continue;
+    if (TRACE0) console.log(`  [trace] chosen ${z.dem ? 'demand/LONG' : 'supply/SHORT'} | RSI=${r.toFixed(1)} need ${z.dem ? '<70' : '>30'} -> ${(z.dem ? r < P.RSI_LONG_MAX : r > P.RSI_SHORT_MIN) ? 'ok' : 'EXIT rsi'}`);
     if (z.dem && !(r < P.RSI_LONG_MAX)) continue;
     if (!z.dem && !(r > P.RSI_SHORT_MIN)) continue;
     F.rsi++;
 
     // rule 8: LTF rejection on this bar
+    if (TRACE0) console.log(`  [trace] rejection candle (pin/engulf/choch): ${rejection(ltf, i, z.dem) ? 'yes' : 'NO -> EXIT'}`);
     if (!rejection(ltf, i, z.dem)) continue;
     F.reject++;
 
@@ -339,6 +396,7 @@ for (const [sym, tick, pv, label] of SYMS) {
     // then scores those stop-outs as wins. 33 of 169 trades were built this way and they
     // averaged +0.857R against +0.148R for the rest, so they inflated every published
     // zones statistic. Reject the geometry instead of trading it.
+    if (TRACE0) console.log(`  [trace] entry=${entry} stop=${stop} -> ${(z.dem ? stop < entry : stop > entry) ? 'ok' : 'EXIT stop on the wrong side (price traded through the zone)'}`);
     if (z.dem ? !(stop < entry) : !(stop > entry)) continue;
     const R = Math.abs(entry - stop);
     if (!(R > 0) || R < 2 * tick) continue;
@@ -348,11 +406,13 @@ for (const [sym, tick, pv, label] of SYMS) {
     const opp = nested.filter((o) => o.dem !== z.dem && !o.mitigated && o.knownTime < b.time
       && (z.dem ? o.htf.proximal > entry : o.htf.proximal < entry))
       .sort((a, c) => z.dem ? a.htf.proximal - c.htf.proximal : c.htf.proximal - a.htf.proximal)[0];
+    if (TRACE0) console.log(`  [trace] opposing zone for target: ${opp ? 'found' : 'NONE -> EXIT'}`);
     if (!opp) continue;
     F.opp++;
     const zoneTp = opp.htf.proximal;
     const zoneRR = Math.abs(zoneTp - entry) / R;
     // the opposing zone must still exist and clear 1:3, exactly as specified...
+    if (TRACE0) console.log(`  [trace] zone RR=${zoneRR.toFixed(2)} need >=${P.MIN_RR} -> ${zoneRR >= P.MIN_RR ? 'ok' : 'EXIT rr'}`);
     if (zoneRR < P.MIN_RR) continue;
     // ...but in fixedR mode we bank at MIN_RR instead of riding to the zone.
     const tp = P.TP_MODE === 'fixedR'

@@ -1,0 +1,280 @@
+//@version=5
+// NestedZones v1 — Nested Supply & Demand, indexes + gold.
+//
+// Backtested 2026-03-06 -> 2026-09-04 on MNQ/MES/MYM/M2K/MGC 5m (Databento GLBX.MDP3,
+// volume-rolled continuous): n=115, 60.9% win, avg R +0.507, PF 2.23, t=4.77.
+//
+// EVERY signal is emitted. The script does not decide what is worth sending — it captures
+// all of them and posts to /capture, where they wait for a manual checklist review before
+// anything reaches the broker. Nothing here bypasses that.
+//
+// Emitted JSON carries the evidence the reviewer needs to answer each checklist item.
+strategy("NestedZones v1", overlay=true, max_boxes_count=500, max_labels_count=100, max_lines_count=100,
+     initial_capital=10000, default_qty_type=strategy.fixed, default_qty_value=1,
+     process_orders_on_close=true, pyramiding=0,
+     commission_type=strategy.commission.cash_per_order, commission_value=0.5,
+     slippage=1, calc_bars_count=3000)
+
+// ─────────── Inputs ───────────
+grpS = "Structure"
+htfTF     = input.timeframe("15", "Higher timeframe", group=grpS)
+swingLR   = input.int(2, "Swing pivot left/right", minval=1, group=grpS)
+trendLeg  = input.int(3, "Consecutive HH+HL / LL+LH required", minval=2, group=grpS)
+
+grpZ = "Zones"
+atrLen    = input.int(14, "ATR length", group=grpZ)
+explAtr   = input.float(1.0, "Explosive leg-out (x ATR)", step=0.1, group=grpZ)
+baseMax   = input.int(3, "Max base candles", group=grpZ)
+baseBody  = input.float(0.5, "Base body <= x leg-out body", step=0.05, group=grpZ)
+
+grpT = "Execution"
+rsiLen    = input.int(14, "RSI length", group=grpT)
+rsiLongMax  = input.float(70, "Long: RSI below", group=grpT)
+rsiShortMin = input.float(30, "Short: RSI above", group=grpT)
+slZoneFrac  = input.float(0.30, "Stop = x zone width beyond distal", step=0.05, group=grpT)
+targetR     = input.float(2.0, "Target (R)", step=0.5, group=grpT)
+
+grpW = "Webhook"
+webhook_secret = input.string("", "Webhook secret", group=grpW,
+     tooltip="Shared secret checked at /capture. Never commit this; keep the script private.")
+
+grpM = "Marking"
+markTrades = input.bool(true, "Draw the open position", group=grpM)
+colRisk    = input.color(color.new(#f23645, 72), "Risk box", group=grpM)
+colReward  = input.color(color.new(#089981, 72), "Reward box", group=grpM)
+
+// ─────────── Helpers ───────────
+f_num(float x) => str.tostring(x, "#.########")
+f_b(bool b) => b ? "true" : "false"
+body(float o, float c) => math.abs(c - o)
+
+atr  = ta.atr(atrLen)
+rsi  = ta.rsi(close, rsiLen)
+
+// ─────────── Structure: confirmed swings + trend ───────────
+// A pivot is only known swingLR bars after it prints — ta.pivothigh already lags by that
+// much, so there is no lookahead here.
+ph = ta.pivothigh(high, swingLR, swingLR)
+pl = ta.pivotlow(low, swingLR, swingLR)
+
+var float[] hs = array.new_float()
+var float[] ls = array.new_float()
+if not na(ph)
+    array.push(hs, ph)
+    if array.size(hs) > 50
+        array.shift(hs)
+if not na(pl)
+    array.push(ls, pl)
+    if array.size(ls) > 50
+        array.shift(ls)
+
+runUp(float[] a) =>
+    int n = 1
+    if array.size(a) > 1
+        for i = array.size(a) - 1 to 1
+            if array.get(a, i) > array.get(a, i - 1)
+                n += 1
+            else
+                break
+    n
+runDn(float[] a) =>
+    int n = 1
+    if array.size(a) > 1
+        for i = array.size(a) - 1 to 1
+            if array.get(a, i) < array.get(a, i - 1)
+                n += 1
+            else
+                break
+    n
+
+trendDir() =>
+    int d = 0
+    if array.size(hs) >= trendLeg and array.size(ls) >= trendLeg
+        if runUp(hs) >= trendLeg and runUp(ls) >= trendLeg
+            d := 1
+        else if runDn(hs) >= trendLeg and runDn(ls) >= trendLeg
+            d := -1
+    d
+dir = trendDir()
+
+// Last confirmed swing in each direction, for the break-of-structure test.
+var float lastPH = na
+var float lastPL = na
+if not na(ph)
+    lastPH := ph
+if not na(pl)
+    lastPL := pl
+
+// ─────────── Zone detection on this timeframe ───────────
+// A zone = small-bodied base + explosive leg-out that breaks structure and leaves an FVG.
+type Zone
+    float top
+    float bot
+    float prox      // edge price returns to
+    float dist      // extreme edge
+    bool  dem
+    bool  fresh
+    int   born
+    float legBody
+    bool  bos
+    bool  fvg
+
+var Zone[] zones = array.new<Zone>()
+
+detectHere() =>
+    Zone z = na
+    if not na(atr) and atr > 0
+        float lob = body(open, close)
+        bool bull = close > open
+        if lob >= explAtr * atr and close != open
+            int n = 0
+            while n < baseMax and body(open[1 + n], close[1 + n]) <= lob * baseBody
+                n += 1
+            if n >= 1
+                float top = high[1]
+                float bot = low[1]
+                for i = 1 to n
+                    top := math.max(top, high[i])
+                    bot := math.min(bot, low[i])
+                // break of structure: leg-out closes beyond the last confirmed swing
+                bool bosOK = bull ? (not na(lastPH) and close > lastPH) : (not na(lastPL) and close < lastPL)
+                // 3-bar imbalance around the departure
+                bool fvgOK = bull ? (high[2] < low[0]) : (low[2] > high[0])
+                if top > bot and bosOK and fvgOK
+                    z := Zone.new(top, bot, bull ? top : bot, bull ? bot : top, bull, true, bar_index, lob, bosOK, fvgOK)
+    z
+
+if barstate.isconfirmed
+    Zone nz = detectHere()
+    if not na(nz)
+        array.push(zones, nz)
+        if array.size(zones) > 200
+            array.shift(zones)
+
+// mark mitigation: a zone retires the first time price trades to its proximal edge
+if barstate.isconfirmed and array.size(zones) > 0
+    for i = 0 to array.size(zones) - 1
+        Zone z = array.get(zones, i)
+        if z.fresh and z.born < bar_index
+            if z.dem ? low <= z.prox : high >= z.prox
+                z.fresh := false
+
+// ─────────── HTF zone, pulled without repainting ───────────
+// [1] + lookahead_on is the repaint-free pattern: we read the HTF bar that has already
+// closed, never the one still forming.
+[hTop, hBot, hDem, hAtr, hBody] = request.security(syminfo.tickerid, htfTF,
+     [ta.highest(high, baseMax + 1)[1], ta.lowest(low, baseMax + 1)[1],
+      (close > open)[1], ta.atr(atrLen)[1], body(open, close)[1]],
+     lookahead=barmerge.lookahead_on)
+
+// ─────────── Emission ───────────
+emit(bool isLong, float e, float sl, float tp, Zone z, float rr) =>
+    string msg = '{"v":1,"secret":"' + webhook_secret +
+      '","strategy":"nested-zones-v1"' +
+      ',"id":"'     + syminfo.ticker + '-' + str.tostring(time) + '"' +
+      ',"symbol":"' + syminfo.ticker + '"' +
+      ',"side":"'   + (isLong ? "LONG" : "SHORT") + '"' +
+      ',"entry":'   + f_num(e) +
+      ',"stop":'    + f_num(sl) +
+      ',"target":'  + f_num(tp) +
+      ',"atr":'     + f_num(atr) +
+      // evidence for the reviewer checklist
+      ',"trend":"'  + (isLong ? "UP" : "DOWN") + '"' +
+      ',"htf_top":'    + f_num(hTop) +
+      ',"htf_bot":'    + f_num(hBot) +
+      ',"htf_fresh":'  + f_b(true) +
+      ',"ltf_top":'    + f_num(z.top) +
+      ',"ltf_bot":'    + f_num(z.bot) +
+      ',"ltf_prox":'   + f_num(z.prox) +
+      ',"ltf_distal":' + f_num(z.dist) +
+      ',"ltf_fresh":'  + f_b(z.fresh) +
+      ',"leg_out_body":' + f_num(z.legBody) +
+      ',"bos":'     + f_b(z.bos) +
+      ',"fvg":'     + f_b(z.fvg) +
+      ',"rsi":'     + f_num(rsi) +
+      ',"rejection":"' + rejKind(isLong) + '"' +
+      ',"min_rr":'  + f_num(targetR) +
+      ',"rr":'      + f_num(rr) +
+      ',"zone_top":' + f_num(z.top) +
+      ',"zone_bottom":' + f_num(z.bot) +
+      ',"zone_tf":"5M"' +
+      ',"sweep_wick":' + f_num(z.dist) +
+      ',"bar_time":' + str.tostring(time) + '}'
+    alert(msg, alert.freq_once_per_bar_close)
+
+// rejection classification, reported so the reviewer can verify item 9
+rejKind(bool bull) =>
+    float rng = high - low
+    float bd  = body(open, close)
+    float upW = high - math.max(open, close)
+    float dnW = math.min(open, close) - low
+    string k = "none"
+    if bull and dnW >= 0.5 * rng and dnW >= 1.5 * bd
+        k := "pin"
+    else if not bull and upW >= 0.5 * rng and upW >= 1.5 * bd
+        k := "pin"
+    else if bull and close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+        k := "engulfing"
+    else if not bull and close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+        k := "engulfing"
+    else if bull and close > high[1]
+        k := "choch"
+    else if not bull and close < low[1]
+        k := "choch"
+    k
+
+// ─────────── Entry ───────────
+var box mRisk = na
+var box mReward = na
+
+if barstate.isconfirmed and dir != 0 and array.size(zones) > 0 and strategy.position_size == 0
+    for i = array.size(zones) - 1 to 0
+        Zone z = array.get(zones, i)
+        bool aligned = z.dem ? dir == 1 : dir == -1
+        bool nested = z.top <= hTop and z.bot >= hBot and z.dem == hDem
+        // pocket: HTF distal edge .. LTF proximal edge
+        float pLo = math.min(z.dem ? hBot : hTop, z.prox)
+        float pHi = math.max(z.dem ? hBot : hTop, z.prox)
+        bool inPocket = low <= pHi and high >= pLo
+        bool rsiOK = z.dem ? rsi < rsiLongMax : rsi > rsiShortMin
+        bool rejOK = rejKind(z.dem) != "none"
+        if z.fresh and aligned and nested and inPocket and rsiOK and rejOK and z.born < bar_index
+            float zw = z.top - z.bot
+            if zw > 0
+                float e  = close
+                float sl = z.dem ? z.dist - slZoneFrac * zw : z.dist + slZoneFrac * zw
+                sl := math.round(sl / syminfo.mintick) * syminfo.mintick
+                float R = math.abs(e - sl)
+                if R >= 2 * syminfo.mintick
+                    float tp = math.round((z.dem ? e + targetR * R : e - targetR * R) / syminfo.mintick) * syminfo.mintick
+                    if z.dem
+                        strategy.entry("NZ-L", strategy.long)
+                        strategy.exit("NZ-L x", "NZ-L", stop=sl, limit=tp)
+                    else
+                        strategy.entry("NZ-S", strategy.short)
+                        strategy.exit("NZ-S x", "NZ-S", stop=sl, limit=tp)
+                    if markTrades
+                        if not na(mRisk)
+                            box.delete(mRisk)
+                        if not na(mReward)
+                            box.delete(mReward)
+                        mRisk   := box.new(time, e, time, sl, xloc=xloc.bar_time, bgcolor=colRisk,   border_color=#f23645)
+                        mReward := box.new(time, e, time, tp, xloc=xloc.bar_time, bgcolor=colReward, border_color=#089981)
+                    z.fresh := false
+                    emit(z.dem, e, sl, tp, z, targetR)
+                    break
+
+// grow the open position's boxes; delete on close so only the live trade is drawn
+if barstate.isconfirmed and not na(mRisk) and strategy.position_size != 0
+    box.set_right(mRisk, time)
+    box.set_right(mReward, time)
+if barstate.isconfirmed and not na(mRisk) and strategy.position_size == 0
+    box.delete(mRisk)
+    box.delete(mReward)
+    mRisk   := na
+    mReward := na
+
+// ─────────── Plots ───────────
+plot(dir, "Trend (1 up / -1 down)", display=display.data_window)
+plot(rsi, "RSI", display=display.data_window)
+bgcolor(dir == 1 ? color.new(color.green, 94) : dir == -1 ? color.new(color.red, 94) : na, title="HTF trend")

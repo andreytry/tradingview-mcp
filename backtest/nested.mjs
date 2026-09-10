@@ -203,6 +203,13 @@ const SYMS = [
   ['6E', 0.00005, 125000, 'Euro FX'],
 ];
 
+// Extra contracts can be appended without editing this file, so a data pull and a
+// regression can run as one command: EXTRA_SYMS='[["6B",0.0001,62500,"British pound"]]'
+// Entries are [symbol, tick, pointValue, label] and need matching _1m/_5m files in D.
+if (process.env.EXTRA_SYMS) {
+  for (const e of JSON.parse(process.env.EXTRA_SYMS)) SYMS.push(e);
+}
+
 const all = [];
 const perSym = [];
 

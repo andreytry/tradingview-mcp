@@ -229,9 +229,15 @@ if barstate.isconfirmed and dir != 0 and array.size(zones) > 0 and strategy.posi
                         mRisk   := box.new(time, e, time, sl, xloc=xloc.bar_time, bgcolor=colRisk, border_color=#f23645)
                         mReward := box.new(time, e, time, tp, xloc=xloc.bar_time, bgcolor=colReward, border_color=#089981)
                     z.fresh := false
+                    // The deployed backend only accepts "nested-zones-v1"; the release that
+                    // adds "single-zones-v1" is not on the box yet. Send the accepted name so
+                    // BOTH variants trade, and carry the real variant in fields that survive
+                    // the trip: the id prefix, variant, zone_tf and nested. Revert the strategy
+                    // line once the backend is updated.
                     string msg = '{"v":1,"secret":"' + webhook_secret +
-                      '","strategy":"' + (requireNesting ? "nested-zones-v1" : "single-zones-v1") + '"' +
-                      ',"id":"'     + syminfo.ticker + '-' + str.tostring(time) + '"' +
+                      '","strategy":"nested-zones-v1"' +
+                      ',"variant":"' + (requireNesting ? "nested" : "single") + '"' +
+                      ',"id":"'     + (requireNesting ? "NZ-" : "SZ-") + syminfo.ticker + '-' + str.tostring(time) + '"' +
                       ',"symbol":"' + syminfo.ticker + '"' +
                       ',"side":"'   + (z.dem ? "LONG" : "SHORT") + '"' +
                       ',"entry":'   + f_num(e) +
@@ -255,7 +261,7 @@ if barstate.isconfirmed and dir != 0 and array.size(zones) > 0 and strategy.posi
                       ',"rr":'      + f_num(targetR) +
                       ',"zone_top":' + f_num(z.top) +
                       ',"zone_bottom":' + f_num(z.bot) +
-                      ',"zone_tf":"5M","nested":' + (requireNesting ? "true" : "false") + '' +
+                      ',"zone_tf":"5M ' + (requireNesting ? "nested" : "single") + '","nested":' + (requireNesting ? "true" : "false") + '' +
                       ',"sweep_wick":' + f_num(z.dist) +
                       ',"bar_time":' + str.tostring(time) + '}'
                     alert(msg, alert.freq_once_per_bar_close)

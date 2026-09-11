@@ -27,7 +27,7 @@ const P = {
 
 const SPEC = { MNQ: [0.25, 2], MES: [0.25, 5], MYM: [1.0, 0.5], M2K: [0.1, 5],
                MGC: [0.1, 10], MCL: [0.01, 100], '6E': [0.00005, 125000] };
-const specOf = (s) => SPEC[s.replace(/(2y|y|live)$/, '')] ?? [0.25, 2];
+const specOf = (s) => SPEC[s.replace(/(2y|y|live|now)$/, '')] ?? [0.25, 2];
 
 const body = (b) => Math.abs(b.close - b.open);
 const isGreen = (b) => b.close > b.open;
@@ -192,10 +192,37 @@ function trendFor(S, mins, leg) {
   }
   return S.trend.get(key);
 }
-function zonesFor(S, mins, label) {
-  const key = mins;
+/**
+ * Sub-sample a lower-timeframe series the way request.security() actually delivers it.
+ *
+ * This is the difference between my engine and the deployed Pine script, and it is not
+ * small. On a 30-minute chart, request.security(..., "5", ...) updates ONCE per chart
+ * bar: the script sees the most recent closed 5-minute bar and never the other five.
+ * Reading every 5-minute bar instead finds roughly six times as many 5-minute zones,
+ * which is why this engine reported 228 gold trades where TradingView's own emulator,
+ * running the real script, reported 48.
+ */
+function pineSample(sub, ct) {
+  const out = []; let j = 0, last = null;
+  for (let i = 0; i < ct.length; i++) {
+    while (j < sub.length && sub[j].end <= ct[i].time) last = sub[j++];
+    if (last && (!out.length || out[out.length - 1].time !== last.time)) out.push(last);
+  }
+  return out;
+}
+
+function zonesFor(S, mins, label, ctMins) {
+  const key = `${mins}:${ctMins}:${PINEMTF ? 1 : 0}`;
   if (!S.zones.has(key)) {
-    const { bars, atr } = barsFor(S, mins);
+    let bars, atr;
+    if (PINEMTF && mins < ctMins) {
+      const sub = barsFor(S, mins).bars;
+      const ctBars = barsFor(S, ctMins).bars;
+      bars = pineSample(sub, ctBars);
+      atr = atrSeries(bars, P.atr_length);
+    } else {
+      ({ bars, atr } = barsFor(S, mins));
+    }
     const created = [];
     for (let i = 0; i < bars.length; i++) { const z = detectZoneAt(bars, atr, i); if (z) created.push({ ...z, rank: mins }); }
     S.zones.set(key, created);
@@ -209,7 +236,7 @@ function run(S, sym, cfg, from) {
   const { bars: ct, atr: atrCt, emaF, emaS, rsi } = barsFor(S, cfg.ct);
   const tfs = [...new Set([...ZONE_TF_SET, cfg.ct])].sort((a, b) => b - a);
   const streams = tfs.map((m) => ({ mins: m, label: m === cfg.ct ? 'CT' : `${m}M`,
-    created: zonesFor(S, m, m === cfg.ct ? 'CT' : `${m}M`), ptr: 0 }));
+    created: zonesFor(S, m, m === cfg.ct ? 'CT' : `${m}M`, cfg.ct), ptr: 0 }));
 
   // HTF trend state, advanced bar by bar so nothing from the future is read.
   const htfMin = cfg.htf || 60;
@@ -217,6 +244,14 @@ function run(S, sym, cfg, from) {
   let hi = 0, hLast = null, ei = 0, hhllDir = 0;
 
   let live = [], pos = null; const trades = [];
+  // ONEORDER mirrors what the Pine strategy can actually do: hold ONE resting limit at a
+  // time, chosen at the close of each bar as the nearest qualifying zone, and fill only
+  // if price reaches THAT price. The previous behaviour checked every live zone on every
+  // bar, which is equivalent to resting dozens of orders at once and quietly picking
+  // whichever zone the market happened to visit. That inflated both trade count and
+  // quality: on gold it gave 146 trades at PF 2.10 where TradingView's own tester,
+  // running the deployed script, gave 48 at 1.47.
+  let pend = null;
   for (let i = 1; i < ct.length; i++) {
     const b = ct[i], A = atrCt[i];
     if (A == null || emaS[i] == null) continue;
@@ -261,6 +296,48 @@ function run(S, sym, cfg, from) {
       }
     }
     if (pos) continue;
+
+    // --- one-resting-order path -------------------------------------------------
+    if (cfg.oneOrder) {
+      if (pend && (!from || b.time >= from)) {
+        const buy = pend.buy;
+        const hit = buy ? b.low <= pend.entry - cfg.fillThru * tick && b.high >= pend.entry
+                        : b.high >= pend.entry + cfg.fillThru * tick && b.low <= pend.entry;
+        if (hit && !pend.z.used) {
+          pend.z.used++;
+          pos = { side: buy ? 'LONG' : 'SHORT', t: b.time, i, label: pend.z.label,
+            entry: pend.entry, fill: buy ? pend.entry + tick : pend.entry - tick,
+            stop: pend.sl, risk: pend.risk, tp: pend.tp, beDone: false, mfe: 0 };
+        }
+      }
+      // choose the order to rest for the next bar
+      pend = null;
+      let best = Infinity;
+      for (const z of live) {
+        if (!(b.time > z.legoutTime)) continue;
+        if (z.used) continue;
+        if (cfg.strongAtr && !(z.legStrength >= cfg.strongAtr)) continue;
+        if (cfg.maxBase && !(z.smallCount <= cfg.maxBase)) continue;
+        if (cfg.nested && !live.some((q) => q.rank > z.rank && q.type === z.type && z.top <= q.top && z.bot >= q.bot)) continue;
+        const buy = z.type === 'Demand';
+        if (cfg.ctx === 'trend') { if (buy ? !up : up) continue; }
+        else if (cfg.ctx === 'htfcandle') { if (!hLast) continue; const u = hLast.close > hLast.open; if (buy ? !u : u) continue; }
+        const e = buy ? z.top : z.bot;
+        const hgt = z.top - z.bot;
+        const sl = buy ? z.bot - hgt * cfg.slPct : z.top + hgt * cfg.slPct;
+        const risk = Math.abs(e - sl);
+        if (!(risk > 0)) continue;
+        if (cfg.maxRiskAtr && !(risk <= A * cfg.maxRiskAtr)) continue;
+        if (buy ? !(sl < e) : !(sl > e)) continue;
+        // the script only rests into a level price has not already passed through
+        if (buy ? !(b.close > e) : !(b.close < e)) continue;
+        const d = Math.abs(b.close - e);
+        if (d < best) { best = d; pend = { z, buy, entry: e, sl, risk, tp: buy ? e + cfg.rr * risk : e - cfg.rr * risk }; }
+      }
+      continue;
+    }
+    // --- end one-resting-order path ----------------------------------------------
+
     if (from && b.time < from) continue;
 
     const up = emaF[i] > emaS[i];
@@ -274,7 +351,13 @@ function run(S, sym, cfg, from) {
         cond = buy ? (isGreen(b) && b.low <= z.top && b.low >= z.bot && b.high > z.top)
                    : (isRed(b)   && b.high <= z.top && b.high >= z.bot && b.low < z.bot);
       } else { // 'touch' and 'touchclose': price trades into the zone's proximal edge
-        cond = buy ? (b.low <= z.top && b.high >= z.top) : (b.high >= z.bot && b.low <= z.bot);
+        // A resting limit is not filled by price KISSING the level. It has to trade
+        // through it, and even then queue position decides. FILLTHRU=n demands the bar
+        // penetrate n ticks past the limit before the fill is credited. The whole edge
+        // of this strategy is the fill, so this assumption has to be stress-tested
+        // rather than assumed.
+        const thru = cfg.fillThru * tick;
+        cond = buy ? (b.low <= z.top - thru && b.high >= z.top) : (b.high >= z.bot + thru && b.low <= z.bot);
       }
       if (!cond) continue;
 
@@ -359,6 +442,9 @@ const FROM = process.env.FROM ? Date.parse(process.env.FROM + 'T00:00:00Z') / 10
 const TO = process.env.TO ? Date.parse(process.env.TO + 'T00:00:00Z') / 1000 : null;
 const WARMUP = Number(process.env.WARMUP_D || 45) * 86400;
 const SYMS = (process.env.SYMS || 'MNQ2y,MES2y,MYM2y,M2K2y,MGC2y').split(',');
+// PINEMTF=1 models request.security's once-per-chart-bar delivery. Default ON, because
+// off is simply wrong: it describes a script nobody is running.
+const PINEMTF = process.env.PINEMTF !== '0';
 
 export function runAll(cfg, syms = SYMS, from = FROM, to = TO) {
   const out = [];
@@ -378,7 +464,8 @@ if (process.argv[1].endsWith('simplezones.mjs')) {
     rr: Number(process.env.RR || 1.5), be: Number(process.env.BE || 0),
     maxRiskAtr: Number(process.env.MAXRISK || 0), maxBars: Number(process.env.MAXBARS || 0),
     htf: Number(process.env.HTF || 60), leg: Number(process.env.LEG || 3),
-    maxTouch: Number(process.env.MAXTOUCH || 1), entryBar: process.env.ENTRYBAR === '1' };
+    maxTouch: Number(process.env.MAXTOUCH || 1), entryBar: process.env.ENTRYBAR === '1',
+    fillThru: Number(process.env.FILLTHRU || 0), oneOrder: process.env.ONEORDER === '1' };
   const t = runAll(cfg);
   writeFileSync(process.env.OUT || '/tmp/sz.json', JSON.stringify(t));
   const s = stats(t);

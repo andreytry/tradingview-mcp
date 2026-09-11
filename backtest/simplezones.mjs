@@ -275,6 +275,9 @@ function run(S, sym, cfg, from) {
 
     if (pos) {
       const long = pos.side === 'LONG';
+      // In oneOrder mode the exit bracket is not live until the bar after the fill,
+      // because that is when the Pine script submits it.
+      if (cfg.oneOrder && !pos.armed) { pos.armed = true; continue; }
       pos.mfe = Math.max(pos.mfe, (long ? b.high - pos.fill : pos.fill - b.low) / pos.risk);
       if (cfg.be && !pos.beDone) {
         const trig = long ? pos.entry + cfg.be * pos.risk : pos.entry - cfg.be * pos.risk;
@@ -301,13 +304,23 @@ function run(S, sym, cfg, from) {
     if (cfg.oneOrder) {
       if (pend && (!from || b.time >= from)) {
         const buy = pend.buy;
-        const hit = buy ? b.low <= pend.entry - cfg.fillThru * tick && b.high >= pend.entry
-                        : b.high >= pend.entry + cfg.fillThru * tick && b.low <= pend.entry;
+        // TradingView fills a buy limit when the bar's LOW reaches it, full stop; the
+        // high is irrelevant. And when a bar opens already through the limit, the broker
+        // fills at the OPEN, which is a better price than the limit. My previous rule
+        // demanded the bar also trade back up through the limit, which silently threw
+        // away every gap-through fill.
+        const hit = buy ? b.low <= pend.entry - cfg.fillThru * tick
+                        : b.high >= pend.entry + cfg.fillThru * tick;
         if (hit && !pend.z.used) {
+          const px = buy ? Math.min(b.open, pend.entry) : Math.max(b.open, pend.entry);
           pend.z.used++;
+          // The script submits strategy.exit only once it SEES the position, which is the
+          // bar after the fill. So the stop and target cannot be hit on the entry bar.
           pos = { side: buy ? 'LONG' : 'SHORT', t: b.time, i, label: pend.z.label,
-            entry: pend.entry, fill: buy ? pend.entry + tick : pend.entry - tick,
-            stop: pend.sl, risk: pend.risk, tp: pend.tp, beDone: false, mfe: 0 };
+            entry: px, fill: buy ? px + tick : px - tick,
+            stop: pend.sl, risk: Math.abs(px - pend.sl),
+            tp: buy ? px + cfg.rr * Math.abs(px - pend.sl) : px - cfg.rr * Math.abs(px - pend.sl),
+            beDone: false, mfe: 0, armed: false };
         }
       }
       // choose the order to rest for the next bar

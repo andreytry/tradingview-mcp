@@ -273,7 +273,7 @@ function run(S, sym, cfg, from) {
       if (cfg.trigger === 'reject') {
         cond = buy ? (isGreen(b) && b.low <= z.top && b.low >= z.bot && b.high > z.top)
                    : (isRed(b)   && b.high <= z.top && b.high >= z.bot && b.low < z.bot);
-      } else { // 'touch': price trades into the zone's proximal edge
+      } else { // 'touch' and 'touchclose': price trades into the zone's proximal edge
         cond = buy ? (b.low <= z.top && b.high >= z.top) : (b.high >= z.bot && b.low <= z.bot);
       }
       if (!cond) continue;
@@ -293,7 +293,11 @@ function run(S, sym, cfg, from) {
 
       // --- mechanics: entry, stop, target ---
       const hgt = z.top - z.bot;
-      const entry = cfg.trigger === 'reject' ? b.close : (buy ? z.top : z.bot);
+      // 'touch' assumes a resting limit at the proximal edge, which is what a live limit
+      // order does. 'touchclose' takes the bar close instead — what a Pine strategy does
+      // by default with process_orders_on_close. The gap between them is the cost of not
+      // resting an order, and it has to be measured before the script is written.
+      const entry = cfg.trigger === 'touch' ? (buy ? z.top : z.bot) : b.close;
       const sl = buy ? z.bot - hgt * cfg.slPct : z.top + hgt * cfg.slPct;
       const risk = Math.abs(entry - sl);
       if (!(risk > 0)) continue;

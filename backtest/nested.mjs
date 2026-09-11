@@ -177,7 +177,11 @@ function detectZones(bars, sw) {
     if (bull ? !(legOut.close > ref) : !(legOut.close < ref)) continue;
 
     // rule 5: FVG in the departure
-    if (!hasFVG(bars, i - 1, i + 1, bull)) continue;
+    if (PINE_EXACT) {
+      // Pine: bull ? (high[2] < low) : (low[2] > high), evaluated on the leg-out bar.
+      const ok = bull ? (bars[i - 2].high < legOut.low) : (bars[i - 2].low > legOut.high);
+      if (!ok) continue;
+    } else if (!hasFVG(bars, i - 1, i + 1, bull)) continue;
 
     out.push({
       dem: bull, top, bot,
@@ -185,6 +189,10 @@ function detectZones(bars, sw) {
       distal: bull ? bot : top,        // extreme edge
       width: top - bot,
       createdIdx: i,
+      // barTime = when the leg-out bar OPENED. knownTime = when it closed and the zone
+      // became usable. The two differ by the bar length, which is why they must not be
+      // used interchangeably (see the nesting test below).
+      barTime: bars[i].time,
       knownTime: bars[i].endTime,
     });
   }
@@ -222,6 +230,19 @@ const perSym = [];
 // instrument without waiting for the whole universe.
 const ONLY = process.env.ONLY ? process.env.ONLY.split(',').map((s) => s.trim()) : null;
 const MAX_TOUCHES = Number(process.env.MAX_TOUCHES || 1);
+// 'zone'  = an HTF zone detected with the full quality gates (what the backtest has always
+//           meant by nesting)
+// 'range' = what the deployed Pine script actually tests: the rolling high/low of the last
+//           baseMax+1 HTF bars, plus the previous HTF bar's direction. Not a zone.
+const NEST_STYLE = process.env.NEST_STYLE || 'zone';
+// PINE_EXACT=1 replicates the DEPLOYED Pine script rather than the idealised strategy:
+//   - FVG uses only the leg-out bar and the bar two back (the engine's version read bars
+//     AFTER the leg-out bar, which is lookahead: zone validity depended on the future)
+//   - the HTF test is the rolling high/low window the script actually reads
+//   - the pocket spans that window's far edge to the zone's proximal edge
+//   - no opposing-zone requirement: the script banks a fixed R and never looks for one
+//   - no roll-day skip: the script has no such concept
+const PINE_EXACT = process.env.PINE_EXACT === '1';
 // ZBAND=29195,29235 reports the life of every zone overlapping that price band.
 const ZBAND = process.env.ZBAND ? process.env.ZBAND.split(',').map(Number) : null;
 
@@ -240,17 +261,55 @@ for (const [sym, tick, pv, label] of SYMS) {
   const swL = swings(ltf, P.SWING_LR);
   const trend = trendTimeline(swH);
 
+  // Rolling HTF window, mirroring ta.highest/ta.lowest(baseMax+1)[1] on the HTF series.
+  const W = P.BASE_MAX + 1;
+  const htfRoll = htf.map((_, k) => {
+    if (k - 1 < W - 1) return null;                 // [1]: use the PREVIOUS closed HTF bar
+    let hi = -Infinity, lo = Infinity;
+    for (let j = k - W; j <= k - 1; j++) { hi = Math.max(hi, htf[j].high); lo = Math.min(lo, htf[j].low); }
+    return { hTop: hi, hBot: lo, hDem: htf[k - 1].close > htf[k - 1].open, endTime: htf[k].endTime };
+  });
+  // For an LTF bar, the applicable window is the last HTF bar that has already closed.
+  const rollAt = (t) => {
+    let out = null;
+    for (const r of htfRoll) { if (r && r.endTime <= t) out = r; else if (r && r.endTime > t) break; }
+    return out;
+  };
+
   const zH = detectZones(htf, swH);
   const zL = detectZones(ltf, swL);
 
   // Tradable-zone construction.
   const nested = [];
-  if (P.NEST_MODE === 'on') {
+  if (P.NEST_MODE === 'on' && (NEST_STYLE === 'range' || PINE_EXACT)) {
+    for (const l of zL) {
+      nested.push({
+        dem: l.dem, htf: l, ltf: l,
+        knownTime: l.knownTime,
+        pocketLo: Math.min(l.proximal, l.distal),
+        pocketHi: Math.max(l.proximal, l.distal),
+        rangeTest: true,
+        mitigated: false,
+      });
+    }
+  } else if (P.NEST_MODE === 'on') {
     // rule 2 (strict): LTF base entirely inside an HTF base, same direction
     for (const h of zH) {
       for (const l of zL) {
         if (l.dem !== h.dem) continue;
-        if (l.knownTime < h.knownTime) continue;           // inner must exist by/after outer
+        // The inner base must not predate the outer one. Compare the leg-out BAR times,
+        // not the confirmation times.
+        //
+        // Confirmation times are wrong here: a 5m zone inside a 15m zone is always
+        // confirmed first, because the 15m bar has not closed yet when the 5m one has.
+        // Comparing them therefore rejected EVERY nest created by a single impulse —
+        // exactly the drop-base-drop case the strategy is meant to trade. Verified on
+        // MNQ 2026-09-10: 5m zone 29210-29263 known 08:35, 15m zone 29210-29279.75 known
+        // 08:40, pair discarded, and the setup was invisible to the strategy all day.
+        //
+        // Lookahead is still prevented downstream: a nest carries knownTime =
+        // max(h, l) and is only tradable once bar.time passes it.
+        if (l.barTime < h.barTime) continue;
         if (!(l.top <= h.top && l.bot >= h.bot)) continue; // strictly inside
         nested.push({
           dem: h.dem, htf: h, ltf: l,
@@ -305,7 +364,7 @@ for (const [sym, tick, pv, label] of SYMS) {
     }
     if (b.time < inTrade) continue;
     const day = et(b.time).date;
-    if (rollDays.has(day)) continue;
+    if (rollDays.has(day) && !PINE_EXACT) continue;
 
     F.bars++;
     const dir = trendAt(trend, b.time);
@@ -318,9 +377,19 @@ for (const [sym, tick, pv, label] of SYMS) {
     // tradable) return was always discarded — that bug produced 7 trades in 6 months.
 
     // candidate: fresh nested zone aligned with trend that price is inside the pocket of
-    const cands = nested.filter((z) => z.knownTime < b.time && !z.mitigated
-      && (z.dem ? dir === 1 : dir === -1)
-      && b.low <= z.pocketHi && b.high >= z.pocketLo);
+    const roll = (NEST_STYLE === 'range' || PINE_EXACT) ? rollAt(b.time) : null;
+    const pocketOf = (z) => {
+      if (!z.rangeTest || !roll) return [z.pocketLo, z.pocketHi];
+      const hDist = z.dem ? roll.hBot : roll.hTop;      // Pine: hDist = z.dem ? hBot : hTop
+      return [Math.min(hDist, z.ltf.proximal), Math.max(hDist, z.ltf.proximal)];
+    };
+    const cands = nested.filter((z) => {
+      if (!(z.knownTime < b.time) || z.mitigated) return false;
+      if (!(z.dem ? dir === 1 : dir === -1)) return false;
+      if (z.rangeTest && !(roll && z.ltf.top <= roll.hTop && z.ltf.bot >= roll.hBot && z.dem === roll.hDem)) return false;
+      const [lo, hi] = pocketOf(z);
+      return b.low <= hi && b.high >= lo;
+    });
     if (nested.some((z) => z.knownTime < b.time && !z.mitigated && (z.dem ? dir === 1 : dir === -1))) F.freshAligned++;
     if (TRACE0) {
       const aligned = nested.filter((z) => z.knownTime < b.time && !z.mitigated && (z.dem ? dir === 1 : dir === -1));
@@ -407,13 +476,13 @@ for (const [sym, tick, pv, label] of SYMS) {
       && (z.dem ? o.htf.proximal > entry : o.htf.proximal < entry))
       .sort((a, c) => z.dem ? a.htf.proximal - c.htf.proximal : c.htf.proximal - a.htf.proximal)[0];
     if (TRACE0) console.log(`  [trace] opposing zone for target: ${opp ? 'found' : 'NONE -> EXIT'}`);
-    if (!opp) continue;
+    if (!opp && !PINE_EXACT) continue;
     F.opp++;
-    const zoneTp = opp.htf.proximal;
+    const zoneTp = opp ? opp.htf.proximal : (z.dem ? entry + P.MIN_RR * R : entry - P.MIN_RR * R);
     const zoneRR = Math.abs(zoneTp - entry) / R;
     // the opposing zone must still exist and clear 1:3, exactly as specified...
     if (TRACE0) console.log(`  [trace] zone RR=${zoneRR.toFixed(2)} need >=${P.MIN_RR} -> ${zoneRR >= P.MIN_RR ? 'ok' : 'EXIT rr'}`);
-    if (zoneRR < P.MIN_RR) continue;
+    if (zoneRR < P.MIN_RR && !PINE_EXACT) continue;
     // ...but in fixedR mode we bank at MIN_RR instead of riding to the zone.
     const tp = P.TP_MODE === 'fixedR'
       ? R2(z.dem ? entry + P.MIN_RR * R : entry - P.MIN_RR * R)

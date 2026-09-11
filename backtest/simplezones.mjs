@@ -402,6 +402,12 @@ function run(S, sym, cfg, from) {
         // Dollar risk, not ATR. One contract of this instrument risks this many dollars
         // on this stop; if that alone blows the budget the setup is untradeable at this
         // account size no matter how good it looks.
+        // Minimum stop distance in TICKS. Commission and slippage are charged per
+        // contract and do not shrink with the stop, so a tight stop pays the same cost
+        // against a smaller R. Scaling the position to a fixed dollar risk does NOT help:
+        // it multiplies contracts and commission together and leaves the ratio unchanged.
+        // Only refusing the tight setups does. GlobexTraps already does this (minTicks=16).
+        if (cfg.minTicks && risk < cfg.minTicks * tick) { F.tooTight = (F.tooTight || 0) + 1; continue; }
         const oneLot = risk * pv;
         if (cfg.maxRiskUsd && oneLot > cfg.maxRiskUsd) { F.tooWide++; continue; }
         if (cfg.maxRiskAtr && !(risk <= A * cfg.maxRiskAtr)) { F.tooWide++; continue; }
@@ -556,7 +562,8 @@ if (process.argv[1].endsWith('simplezones.mjs')) {
     htf: Number(process.env.HTF || 60), leg: Number(process.env.LEG || 3),
     maxTouch: Number(process.env.MAXTOUCH || 1), entryBar: process.env.ENTRYBAR === '1',
     fillThru: Number(process.env.FILLTHRU || 0), oneOrder: process.env.ONEORDER === '1',
-    riskUsd: Number(process.env.RISK_USD || 0), maxRiskUsd: Number(process.env.MAXRISK_USD || 0) };
+    riskUsd: Number(process.env.RISK_USD || 0), maxRiskUsd: Number(process.env.MAXRISK_USD || 0),
+    minTicks: Number(process.env.MINTICKS || 0) };
   const t = runAll(cfg);
   writeFileSync(process.env.OUT || '/tmp/sz.json', JSON.stringify(t));
   const s = stats(t);

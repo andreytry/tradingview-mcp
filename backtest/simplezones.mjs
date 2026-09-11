@@ -306,6 +306,26 @@ function run(S, sym, cfg, from) {
       pos = { side: buy ? 'LONG' : 'SHORT', t: b.time, i, label: z.label, entry,
         fill: buy ? entry + tick : entry - tick, stop: sl, risk,
         tp: buy ? entry + cfg.rr * risk : entry - cfg.rr * risk, beDone: false, mfe: 0 };
+      // ENTRYBAR=1 also resolves the entry bar itself. The bar that touches the zone can
+      // keep going and take the stop inside the same bar; ignoring that flatters the
+      // result, and on a 30-minute bar the omission is not small. Stop wins a tie.
+      if (cfg.entryBar) {
+        // Only the STOP may resolve on the entry bar. Awarding the target here would
+        // assume the bar's extreme came after the touch, which is lookahead inside the
+        // bar; allowing only the loss is the pessimistic reading of the same ambiguity.
+        const hitSL0 = buy ? b.low <= pos.stop : b.high >= pos.stop;
+        const hitTP0 = false;
+        if (hitSL0 || hitTP0) {
+          const px = hitSL0 ? pos.stop : pos.tp;
+          const ex = buy ? px - tick : px + tick;
+          const rr0 = (buy ? ex - pos.fill : pos.fill - ex) / pos.risk;
+          trades.push({ sym, dir: pos.side, zoneTf: pos.label,
+            date: new Date(pos.t * 1000).toISOString().slice(0, 10), entryTime: pos.t,
+            res: hitSL0 ? 'STOP' : 'TARGET', r: Number(rr0.toFixed(4)),
+            usd: Number((rr0 * pos.risk * pv).toFixed(2)), mfe: 0 });
+          pos = null;
+        }
+      }
       break;
     }
   }
@@ -354,7 +374,7 @@ if (process.argv[1].endsWith('simplezones.mjs')) {
     rr: Number(process.env.RR || 1.5), be: Number(process.env.BE || 0),
     maxRiskAtr: Number(process.env.MAXRISK || 0), maxBars: Number(process.env.MAXBARS || 0),
     htf: Number(process.env.HTF || 60), leg: Number(process.env.LEG || 3),
-    maxTouch: Number(process.env.MAXTOUCH || 1) };
+    maxTouch: Number(process.env.MAXTOUCH || 1), entryBar: process.env.ENTRYBAR === '1' };
   const t = runAll(cfg);
   writeFileSync(process.env.OUT || '/tmp/sz.json', JSON.stringify(t));
   const s = stats(t);

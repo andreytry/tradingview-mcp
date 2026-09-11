@@ -16,10 +16,10 @@
 // THE ENTRY MUST REST AS A LIMIT AT THE ZONE EDGE. Taking the same signals at the bar
 // close instead gives PF 0.75 over the same two years. The edge is the fill, not the
 // filter. Do not convert this to a market order.
-strategy("MinimalZones v1", overlay=true, max_boxes_count=500, max_labels_count=100,
+strategy("MinimalZones v1", overlay=true, max_boxes_count=500, max_labels_count=100, max_lines_count=100,
      initial_capital=10000, default_qty_type=strategy.fixed, default_qty_value=1,
      pyramiding=0, commission_type=strategy.commission.cash_per_order, commission_value=0.5,
-     slippage=1, calc_bars_count=5000)
+     slippage=1)
 
 grpZ = "Zones (original script's rules)"
 atrLen     = input.int(14,   "ATR length",                        group=grpZ)
@@ -43,49 +43,60 @@ slPct      = input.float(0.30, "Stop = x zone height beyond far edge", step=0.05
 targetR    = input.float(2.0,  "Target (R)",           step=0.5, group=grpE)
 maxRiskAtr = input.float(1.0,  "Skip if risk > x ATR", step=0.1, group=grpE)
 
-grpW = "Webhook"
-webhook_secret = input.string("", "Webhook secret", group=grpW,
-     tooltip="Shared secret checked by the backend. Keep this script private.")
+grpM = "Marking"
+markZones    = input.bool(true, "Draw qualified zones", group=grpM)
+markPending  = input.bool(true, "Draw the resting limit", group=grpM)
+markPosition = input.bool(true, "Draw the open position", group=grpM)
+colDemand    = input.color(color.new(#089981, 80), "Demand zone (green)", group=grpM)
+colSupply    = input.color(color.new(#f23645, 80), "Supply zone (red)", group=grpM)
+colRisk      = input.color(color.new(#f23645, 70), "Risk box (red)", group=grpM)
+colReward    = input.color(color.new(#089981, 70), "Reward box (green)", group=grpM)
 
-// ─────────── zone type ───────────
+grpW = "Webhook"
+webhook_secret = input.string("", "Webhook secret", group=grpW, tooltip="Shared secret checked by the backend. Keep this script private.")
+
 type Zone
     float top
     float bot
     bool  dem
-    int   rank          // timeframe in minutes; nesting compares this
+    int   rank
     int   baseN
-    float legAtr        // leg-out body measured in ATR
+    float legAtr
     int   bornAt
-    bool  used          // one trade per zone
+    bool  used
+    box   bx
 
 var array<Zone> zones = array.new<Zone>()
 
 f_num(float x) => str.tostring(math.round_to_mintick(x))
-body(float o, float c) => math.abs(c - o)
+bodyOf(float o, float c) => math.abs(c - o)
 
-// ─────────── detection on one timeframe ───────────
 // A direct transcription of detect_mtf_patterns_universal plus
 // find_zone_boundaries_universal from the original script. Index 0 is the leg-out bar.
-detect(array<float> oh, array<float> hh, array<float> lh, array<float> ch,
-       array<float> ah, int rank) =>
+detect(array<float> oh, array<float> hh, array<float> lh, array<float> ch, array<float> ah, int rank) =>
     Zone z = na
     if array.size(oh) >= maxSmall + 2
-        float cO = array.get(oh, 0), cC = array.get(ch, 0), cA = array.get(ah, 0)
-        if not na(cO) and not na(cC) and not na(cA) and cA > 0
-            float cB = body(cO, cC)
-            if cB >= cA * legOutAtr and cC != cO
+        float cO = array.get(oh, 0)
+        float cC = array.get(ch, 0)
+        float cA = array.get(ah, 0)
+        if not na(cO) and not na(cC) and not na(cA) and cA > 0 and cC != cO
+            float cB = bodyOf(cO, cC)
+            if cB >= cA * legOutAtr
                 bool cGreen = cC > cO
-                int small = 0, idx = 1
+                int small = 0
+                int idx = 1
                 bool valid = false
                 int legIdx = -1
                 while idx <= maxSmall and idx < array.size(oh)
-                    float sO = array.get(oh, idx), sC = array.get(ch, idx)
-                    float sB = body(sO, sC)
+                    float sO = array.get(oh, idx)
+                    float sC = array.get(ch, idx)
+                    float sB = bodyOf(sO, sC)
                     if small >= 1 and sB >= cB * legRatio
                         valid := true
                         legIdx := idx
                         break
-                    float sH = array.get(hh, idx), sL = array.get(lh, idx)
+                    float sH = array.get(hh, idx)
+                    float sL = array.get(lh, idx)
                     float upW = sH - math.max(sO, sC)
                     float dnW = math.min(sO, sC) - sL
                     bool wickOk = sB > 0 and math.max(upW, dnW) <= sB * maxWick
@@ -99,11 +110,12 @@ detect(array<float> oh, array<float> hh, array<float> lh, array<float> ch,
                     legIdx := math.min(idx, array.size(oh) - 1)
                     valid := true
                 if valid and legIdx > 0
-                    float lO = array.get(oh, legIdx), lC = array.get(ch, legIdx)
+                    float lO = array.get(oh, legIdx)
+                    float lC = array.get(ch, legIdx)
                     if lC != lO
-                        bool lGreen = lC > lO
-                        bool isDem = cGreen                       // green leg-out = demand
-                        float zTop = na, zBot = na
+                        bool isDem = cGreen
+                        float zTop = na
+                        float zBot = na
                         if isDem
                             zTop := math.max(array.get(oh, 1), array.get(ch, 1))
                             zBot := array.get(lh, 0)
@@ -119,21 +131,28 @@ detect(array<float> oh, array<float> hh, array<float> lh, array<float> ch,
                                     zTop := math.max(zTop, array.get(hh, i))
                                     zBot := math.min(zBot, math.min(array.get(oh, i), array.get(ch, i)))
                         if zTop > zBot
-                            z := Zone.new(zTop, zBot, isDem, rank, small, cB / cA, time, false)
+                            z := Zone.new(zTop, zBot, isDem, rank, small, cB / cA, time, false, na)
     z
 
-// ─────────── one history buffer per timeframe ───────────
-var array<float> o60 = array.new<float>(), var array<float> h60 = array.new<float>()
-var array<float> l60 = array.new<float>(), var array<float> c60 = array.new<float>()
+var array<float> o60 = array.new<float>()
+var array<float> h60 = array.new<float>()
+var array<float> l60 = array.new<float>()
+var array<float> c60 = array.new<float>()
 var array<float> a60 = array.new<float>()
-var array<float> o15 = array.new<float>(), var array<float> h15 = array.new<float>()
-var array<float> l15 = array.new<float>(), var array<float> c15 = array.new<float>()
+var array<float> o15 = array.new<float>()
+var array<float> h15 = array.new<float>()
+var array<float> l15 = array.new<float>()
+var array<float> c15 = array.new<float>()
 var array<float> a15 = array.new<float>()
-var array<float> o05 = array.new<float>(), var array<float> h05 = array.new<float>()
-var array<float> l05 = array.new<float>(), var array<float> c05 = array.new<float>()
+var array<float> o05 = array.new<float>()
+var array<float> h05 = array.new<float>()
+var array<float> l05 = array.new<float>()
+var array<float> c05 = array.new<float>()
 var array<float> a05 = array.new<float>()
-var array<float> oCT = array.new<float>(), var array<float> hCT = array.new<float>()
-var array<float> lCT = array.new<float>(), var array<float> cCT = array.new<float>()
+var array<float> oCT = array.new<float>()
+var array<float> hCT = array.new<float>()
+var array<float> lCT = array.new<float>()
+var array<float> cCT = array.new<float>()
 var array<float> aCT = array.new<float>()
 
 push(array<float> a, float v) =>
@@ -141,6 +160,7 @@ push(array<float> a, float v) =>
     if array.size(a) > 300
         array.pop(a)
 
+atrCt = ta.atr(atrLen)
 [o60v, h60v, l60v, c60v, a60v] = request.security(syminfo.tickerid, "60", [open, high, low, close, ta.atr(atrLen)], lookahead=barmerge.lookahead_off)
 [o15v, h15v, l15v, c15v, a15v] = request.security(syminfo.tickerid, "15", [open, high, low, close, ta.atr(atrLen)], lookahead=barmerge.lookahead_off)
 [o05v, h05v, l05v, c05v, a05v] = request.security(syminfo.tickerid, "5",  [open, high, low, close, ta.atr(atrLen)], lookahead=barmerge.lookahead_off)
@@ -153,42 +173,86 @@ new05 = ta.change(time("5"))  != 0
 addZone(Zone z) =>
     if not na(z)
         bool clash = false
-        for i = 0 to math.max(0, array.size(zones) - 1)
-            Zone q = array.get(zones, i)
-            if q.rank == z.rank and q.bot <= z.top and z.bot <= q.top
-                clash := true
-                break
+        if array.size(zones) > 0
+            for i = 0 to array.size(zones) - 1
+                Zone q = array.get(zones, i)
+                if q.rank == z.rank and q.bot <= z.top and z.bot <= q.top
+                    clash := true
+                    break
         if not clash
+            // Only zones that already pass the STRENGTH criterion get a box. Detection
+            // produces thousands; drawing the ones that can never be traded paints the
+            // chart solid and hides the ones that matter.
+            if markZones and z.legAtr >= strongAtr and z.baseN <= maxBase
+                z.bx := box.new(z.bornAt, z.top, z.bornAt, z.bot, xloc=xloc.bar_time,
+                     extend=extend.right,
+                     border_color=z.dem ? #089981 : #f23645,
+                     bgcolor=z.dem ? colDemand : colSupply,
+                     text=(z.rank == 60 ? "60M" : z.rank == 15 ? "15M" : z.rank == 5 ? "5M" : "CT") + (z.dem ? " demand" : " supply"),
+                     text_color=z.dem ? #089981 : #f23645, text_size=size.tiny)
             array.unshift(zones, z)
             if array.size(zones) > maxZones
-                array.pop(zones)
+                Zone gone = array.pop(zones)
+                if not na(gone.bx)
+                    box.delete(gone.bx)
 
 if new60 and not na(o60v)
-    push(o60, o60v), push(h60, h60v), push(l60, l60v), push(c60, c60v), push(a60, a60v)
+    push(o60, o60v)
+    push(h60, h60v)
+    push(l60, l60v)
+    push(c60, c60v)
+    push(a60, a60v)
     addZone(detect(o60, h60, l60, c60, a60, 60))
 if new15 and not na(o15v)
-    push(o15, o15v), push(h15, h15v), push(l15, l15v), push(c15, c15v), push(a15, a15v)
+    push(o15, o15v)
+    push(h15, h15v)
+    push(l15, l15v)
+    push(c15, c15v)
+    push(a15, a15v)
     addZone(detect(o15, h15, l15, c15, a15, 15))
 if new05 and not na(o05v)
-    push(o05, o05v), push(h05, h05v), push(l05, l05v), push(c05, c05v), push(a05, a05v)
+    push(o05, o05v)
+    push(h05, h05v)
+    push(l05, l05v)
+    push(c05, c05v)
+    push(a05, a05v)
     addZone(detect(o05, h05, l05, c05, a05, 5))
 if barstate.isconfirmed
-    push(oCT, open), push(hCT, high), push(lCT, low), push(cCT, close), push(aCT, ta.atr(atrLen))
+    push(oCT, open)
+    push(hCT, high)
+    push(lCT, low)
+    push(cCT, close)
+    push(aCT, atrCt)
     addZone(detect(oCT, hCT, lCT, cCT, aCT, timeframe.in_seconds() / 60))
 
-// ─────────── update_zones(): a zone dies only when BREACHED ───────────
+// update_zones(): a zone dies only when BREACHED
 if array.size(zones) > 0
     for i = array.size(zones) - 1 to 0
         Zone z = array.get(zones, i)
         float amt = (z.top - z.bot) * breachPct
         if (not z.dem and high > z.top + amt) or (z.dem and low < z.bot - amt)
+            // A breached zone stops extending and goes grey, so the chart shows where it
+            // died rather than silently removing the evidence.
+            if not na(z.bx)
+                box.set_right(z.bx, time)
+                box.set_extend(z.bx, extend.none)
+                box.set_bgcolor(z.bx, color.new(color.gray, 92))
+                box.set_border_color(z.bx, color.new(color.gray, 55))
             array.remove(zones, i)
 
-// ─────────── pick a zone and rest a limit at its proximal edge ───────────
-atrNow = ta.atr(atrLen)
-var float pendEntry = na, var float pendStop = na, var float pendTp = na
-var bool  pendLong  = false
-var int   pendIdx   = -1
+var float pendEntry = na
+var float pendStop = na
+var float pendTp = na
+var bool  pendLong = false
+var int   pendIdx = -1
+var line  pendLine = na
+
+// The open position, drawn as two boxes: RED from entry down to the stop, GREEN from
+// entry up to the target. Both extend right as the trade breathes, so at a glance you
+// see what is risked and what is being played for.
+var box mRisk = na
+var box mReward = na
+var label mTag = na
 
 nestedOk(Zone z) =>
     bool ok = not useNested
@@ -200,7 +264,7 @@ nestedOk(Zone z) =>
                 break
     ok
 
-if strategy.position_size == 0 and barstate.isconfirmed and not na(atrNow)
+if strategy.position_size == 0 and barstate.isconfirmed and not na(atrCt)
     pendEntry := na
     pendIdx := -1
     float bestDist = 1e20
@@ -213,8 +277,7 @@ if strategy.position_size == 0 and barstate.isconfirmed and not na(atrNow)
                     float hg = z.top - z.bot
                     float sl = z.dem ? z.bot - hg * slPct : z.top + hg * slPct
                     float rk = math.abs(e - sl)
-                    bool geomOk = rk > 0 and (z.dem ? sl < e : sl > e) and rk <= atrNow * maxRiskAtr
-                    // Only a zone price has not already passed through can be rested into.
+                    bool geomOk = rk > 0 and (z.dem ? sl < e : sl > e) and rk <= atrCt * maxRiskAtr
                     bool ahead = z.dem ? close > e : close < e
                     if geomOk and ahead and math.abs(close - e) < bestDist
                         bestDist := math.abs(close - e)
@@ -223,42 +286,59 @@ if strategy.position_size == 0 and barstate.isconfirmed and not na(atrNow)
                         pendTp    := z.dem ? e + targetR * rk : e - targetR * rk
                         pendLong  := z.dem
                         pendIdx   := i
-
+    if not na(pendLine)
+        line.delete(pendLine)
+        pendLine := na
     if na(pendEntry)
         strategy.cancel_all()
     else
+        if markPending
+            pendLine := line.new(time, pendEntry, time + 20 * timeframe.in_seconds() * 1000, pendEntry,
+                 xloc=xloc.bar_time, color=pendLong ? #089981 : #f23645, style=line.style_dashed, width=1)
         if pendLong
             strategy.entry("L", strategy.long, limit=pendEntry)
         else
             strategy.entry("S", strategy.short, limit=pendEntry)
 
-// mark the zone spent and emit the signal the moment the limit fills
+// the limit filled: mark the zone spent, set the exits, draw the position, emit the signal
 if strategy.position_size != 0 and strategy.position_size[1] == 0
     if pendIdx >= 0 and pendIdx < array.size(zones)
         Zone zz = array.get(zones, pendIdx)
         zz.used := true
     strategy.exit(strategy.position_size > 0 ? "L" : "S", stop=pendStop, limit=pendTp)
-    string msg = '{"v":1,"secret":"' + webhook_secret +
-      '","strategy":"minimal-zones-v1"' +
-      ',"id":"MZ-' + syminfo.ticker + '-' + str.tostring(time) + '"' +
-      ',"symbol":"' + syminfo.ticker + '"' +
-      ',"side":"'   + (strategy.position_size > 0 ? "LONG" : "SHORT") + '"' +
-      ',"entry":'   + f_num(pendEntry) +
-      ',"stop":'    + f_num(pendStop) +
-      ',"target":'  + f_num(pendTp) +
-      ',"atr":'     + f_num(atrNow) +
-      ',"rr":'      + f_num(targetR) +
-      ',"zone_top":'    + f_num(pendLong ? pendEntry : pendStop) +
-      ',"zone_bottom":' + f_num(pendLong ? pendStop : pendEntry) +
-      ',"nested":' + (useNested ? "true" : "false") +
-      ',"bar_time":' + str.tostring(time) + '}'
-    alert(msg, alert.freq_once_per_bar)
+    if markPosition
+        if not na(mRisk)
+            box.delete(mRisk)
+        if not na(mReward)
+            box.delete(mReward)
+        if not na(mTag)
+            label.delete(mTag)
+        mRisk   := box.new(time, pendEntry, time, pendStop, xloc=xloc.bar_time, bgcolor=colRisk, border_color=#f23645)
+        mReward := box.new(time, pendEntry, time, pendTp,   xloc=xloc.bar_time, bgcolor=colReward, border_color=#089981)
+        mTag    := label.new(time, pendEntry, (pendLong ? "LONG " : "SHORT ") + f_num(pendEntry),
+             xloc=xloc.bar_time, color=pendLong ? #089981 : #f23645, textcolor=color.white,
+             style=pendLong ? label.style_label_up : label.style_label_down, size=size.tiny)
+    alert('{"v":1,"secret":"' + webhook_secret + '","strategy":"nested-zones-v1","variant":"minimal","id":"MZ-' + syminfo.ticker + '-' + str.tostring(time) + '","symbol":"' + syminfo.ticker + '","side":"' + (strategy.position_size > 0 ? "LONG" : "SHORT") + '","entry":' + f_num(pendEntry) + ',"stop":' + f_num(pendStop) + ',"target":' + f_num(pendTp) + ',"atr":' + f_num(atrCt) + ',"rr":' + f_num(targetR) + ',"zone_top":' + f_num(pendLong ? pendEntry : pendStop) + ',"zone_bottom":' + f_num(pendLong ? pendStop : pendEntry) + ',"zone_tf":"30M minimal","nested":true,"bar_time":' + str.tostring(time) + '}', alert.freq_once_per_bar)
 
-// report the outcome so the backend can book profit or loss
+// while in the trade the two boxes follow price to the right
+if strategy.position_size != 0 and not na(mRisk)
+    box.set_right(mRisk, time)
+    box.set_right(mReward, time)
+
+// flat again: report the outcome so the backend can book profit or loss, and clear the boxes
 if strategy.position_size == 0 and strategy.position_size[1] != 0
     float pnl = strategy.netprofit - strategy.netprofit[1]
-    alert('{"v":1,"secret":"' + webhook_secret +
-      '","strategy":"minimal-zones-v1","event":"fill"' +
-      ',"id":"MZ-' + syminfo.ticker + '-' + str.tostring(time) + '"' +
-      ',"symbol":"' + syminfo.ticker + '"' +
-      ',"pnl":' + f_num(pnl) + '}', alert.freq_once_per_bar)
+    if markPosition and not na(mRisk)
+        box.set_right(mRisk, time)
+        box.set_right(mReward, time)
+        // Keep the winner's reward box and the loser's risk box; drop the other half so
+        // the chart reads as a record of what happened rather than what was hoped for.
+        if pnl >= 0
+            box.delete(mRisk)
+        else
+            box.delete(mReward)
+        mRisk := na
+        mReward := na
+    alert('{"v":1,"secret":"' + webhook_secret + '","strategy":"nested-zones-v1","variant":"minimal","event":"fill","id":"MZ-' + syminfo.ticker + '-' + str.tostring(time) + '","symbol":"' + syminfo.ticker + '","pnl":' + f_num(pnl) + '}', alert.freq_once_per_bar)
+
+plot(strategy.equity, "Equity", display=display.data_window)

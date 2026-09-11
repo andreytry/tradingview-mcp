@@ -19,7 +19,7 @@
 strategy("MinimalZones v1", overlay=true, max_boxes_count=500, max_labels_count=100, max_lines_count=100,
      initial_capital=10000, default_qty_type=strategy.fixed, default_qty_value=1,
      pyramiding=0, commission_type=strategy.commission.cash_per_order, commission_value=0.5,
-     slippage=1)
+     slippage=1, calc_on_every_tick=true)
 
 grpZ = "Zones (original script's rules)"
 atrLen     = input.int(14,   "ATR length",                        group=grpZ)
@@ -31,16 +31,21 @@ maxWick    = input.float(10, "Max wick / body on base candles",   group=grpZ)
 breachPct  = input.float(0.25,"Breach: x zone height beyond edge",step=0.05, group=grpZ)
 maxZones   = input.int(200,  "Max live zones",                    group=grpZ)
 
+grpTF = "Zone timeframes"
+zTF1 = input.timeframe("D",   "Zone TF 1 (highest)", group=grpTF)
+zTF2 = input.timeframe("240", "Zone TF 2",           group=grpTF)
+zTF3 = input.timeframe("60",  "Zone TF 3",           group=grpTF)
+
 grpC = "The three criteria"
 useNested  = input.bool(true, "1 - require nesting in a higher-TF zone", group=grpC)
 strongAtr  = input.float(1.0, "2 - leg-out >= x ATR",     step=0.1, group=grpC)
 maxBase    = input.int(3,     "2 - base <= n candles",    group=grpC)
 useTrend   = input.bool(true, "3 - last closed HTF candle must agree", group=grpC)
-trendTF    = input.timeframe("60", "3 - trend timeframe", group=grpC)
+trendTF    = input.timeframe("D", "3 - trend timeframe", group=grpC)
 
 grpE = "Execution"
 slPct      = input.float(0.30, "Stop = x zone height beyond far edge", step=0.05, group=grpE)
-targetR    = input.float(2.0,  "Target (R)",           step=0.5, group=grpE)
+targetR    = input.float(3.0,  "Target (R)",           step=0.5, group=grpE)
 maxRiskAtr = input.float(1.0,  "Skip if risk > x ATR", step=0.1, group=grpE)
 
 grpM = "Marking"
@@ -161,14 +166,20 @@ push(array<float> a, float v) =>
         array.pop(a)
 
 atrCt = ta.atr(atrLen)
-[o60v, h60v, l60v, c60v, a60v] = request.security(syminfo.tickerid, "60", [open, high, low, close, ta.atr(atrLen)], lookahead=barmerge.lookahead_off)
-[o15v, h15v, l15v, c15v, a15v] = request.security(syminfo.tickerid, "15", [open, high, low, close, ta.atr(atrLen)], lookahead=barmerge.lookahead_off)
-[o05v, h05v, l05v, c05v, a05v] = request.security(syminfo.tickerid, "5",  [open, high, low, close, ta.atr(atrLen)], lookahead=barmerge.lookahead_off)
+[o60v, h60v, l60v, c60v, a60v] = request.security(syminfo.tickerid, zTF1, [open, high, low, close, ta.atr(atrLen)], lookahead=barmerge.lookahead_off)
+[o15v, h15v, l15v, c15v, a15v] = request.security(syminfo.tickerid, zTF2, [open, high, low, close, ta.atr(atrLen)], lookahead=barmerge.lookahead_off)
+[o05v, h05v, l05v, c05v, a05v] = request.security(syminfo.tickerid, zTF3, [open, high, low, close, ta.atr(atrLen)], lookahead=barmerge.lookahead_off)
 trendUpRaw = request.security(syminfo.tickerid, trendTF, close > open, lookahead=barmerge.lookahead_off)
 
-new60 = ta.change(time("60")) != 0
-new15 = ta.change(time("15")) != 0
-new05 = ta.change(time("5"))  != 0
+// rank in minutes, so nesting can compare "is this zone inside a bigger-timeframe one"
+// str.tonumber returns a float; detect() takes an int rank, so round and cast.
+tfMin(string tf) => int(tf == "D" ? 1440 : tf == "W" ? 10080 : math.round(str.tonumber(tf)))
+r1 = tfMin(zTF1)
+r2 = tfMin(zTF2)
+r3 = tfMin(zTF3)
+new60 = ta.change(time(zTF1)) != 0
+new15 = ta.change(time(zTF2)) != 0
+new05 = ta.change(time(zTF3)) != 0
 
 addZone(Zone z) =>
     if not na(z)
@@ -188,7 +199,7 @@ addZone(Zone z) =>
                      extend=extend.right,
                      border_color=z.dem ? #089981 : #f23645,
                      bgcolor=z.dem ? colDemand : colSupply,
-                     text=(z.rank == 60 ? "60M" : z.rank == 15 ? "15M" : z.rank == 5 ? "5M" : "CT") + (z.dem ? " demand" : " supply"),
+                     text=(z.rank >= 1440 ? "D" : z.rank >= 240 ? "4H" : z.rank >= 60 ? "1H" : "CT") + (z.dem ? " demand" : " supply"),
                      text_color=z.dem ? #089981 : #f23645, text_size=size.tiny)
             array.unshift(zones, z)
             if array.size(zones) > maxZones
@@ -202,21 +213,21 @@ if new60 and not na(o60v)
     push(l60, l60v)
     push(c60, c60v)
     push(a60, a60v)
-    addZone(detect(o60, h60, l60, c60, a60, 60))
+    addZone(detect(o60, h60, l60, c60, a60, r1))
 if new15 and not na(o15v)
     push(o15, o15v)
     push(h15, h15v)
     push(l15, l15v)
     push(c15, c15v)
     push(a15, a15v)
-    addZone(detect(o15, h15, l15, c15, a15, 15))
+    addZone(detect(o15, h15, l15, c15, a15, r2))
 if new05 and not na(o05v)
     push(o05, o05v)
     push(h05, h05v)
     push(l05, l05v)
     push(c05, c05v)
     push(a05, a05v)
-    addZone(detect(o05, h05, l05, c05, a05, 5))
+    addZone(detect(o05, h05, l05, c05, a05, r3))
 if barstate.isconfirmed
     push(oCT, open)
     push(hCT, high)
@@ -318,7 +329,7 @@ if strategy.position_size != 0 and strategy.position_size[1] == 0
         mTag    := label.new(time, pendEntry, (pendLong ? "LONG " : "SHORT ") + f_num(pendEntry),
              xloc=xloc.bar_time, color=pendLong ? #089981 : #f23645, textcolor=color.white,
              style=pendLong ? label.style_label_up : label.style_label_down, size=size.tiny)
-    alert('{"v":1,"secret":"' + webhook_secret + '","strategy":"nested-zones-v1","variant":"minimal","id":"MZ-' + syminfo.ticker + '-' + str.tostring(time) + '","symbol":"' + syminfo.ticker + '","side":"' + (strategy.position_size > 0 ? "LONG" : "SHORT") + '","entry":' + f_num(pendEntry) + ',"stop":' + f_num(pendStop) + ',"target":' + f_num(pendTp) + ',"atr":' + f_num(atrCt) + ',"rr":' + f_num(targetR) + ',"zone_top":' + f_num(pendLong ? pendEntry : pendStop) + ',"zone_bottom":' + f_num(pendLong ? pendStop : pendEntry) + ',"zone_tf":"30M minimal","nested":true,"bar_time":' + str.tostring(time) + '}', alert.freq_once_per_bar)
+    alert('{"v":1,"secret":"' + webhook_secret + '","strategy":"nested-zones-v1","variant":"minimal","id":"MZ-' + syminfo.ticker + '-' + str.tostring(time) + '","symbol":"' + syminfo.ticker + '","side":"' + (strategy.position_size > 0 ? "LONG" : "SHORT") + '","entry":' + f_num(pendEntry) + ',"stop":' + f_num(pendStop) + ',"target":' + f_num(pendTp) + ',"atr":' + f_num(atrCt) + ',"rr":' + f_num(targetR) + ',"zone_top":' + f_num(pendLong ? pendEntry : pendStop) + ',"zone_bottom":' + f_num(pendLong ? pendStop : pendEntry) + ',"zone_tf":"1H minimal","nested":true,"bar_time":' + str.tostring(time) + '}', alert.freq_once_per_bar)
 
 // while in the trade the two boxes follow price to the right
 if strategy.position_size != 0 and not na(mRisk)

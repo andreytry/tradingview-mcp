@@ -25,9 +25,36 @@ const P = {
   max_wick_ratio: 10, max_zones: 200, ema_fast_len: 20, ema_slow_len: 50,
 };
 
-const SPEC = { MNQ: [0.25, 2], MES: [0.25, 5], MYM: [1.0, 0.5], M2K: [0.1, 5],
-               MGC: [0.1, 10], MCL: [0.01, 100], '6E': [0.00005, 125000] };
-const specOf = (s) => SPEC[s.replace(/(2y|y|live|now)$/, '')] ?? [0.25, 2];
+/**
+ * Contract specs as [tick, dollars-per-point, name]. MICRO wherever a micro exists,
+ * because the smallest tradable unit decides whether a setup fits a dollar risk budget
+ * at all. A zone that needs $600 of stop on the full-size contract needs $60 on the
+ * micro, which is the difference between skipping it and taking it.
+ *
+ * Where no micro is listed by CME the full-size contract is used and flagged, so the
+ * cost of that is visible rather than hidden.
+ */
+const SPEC = {
+  // index micros
+  MNQ: [0.25, 2, 'Micro Nasdaq'], MES: [0.25, 5, 'Micro S&P'],
+  MYM: [1.0, 0.5, 'Micro Dow'],   M2K: [0.1, 5, 'Micro Russell'],
+  // metals and energy micros
+  MGC: [0.1, 10, 'Micro Gold'], MCL: [0.01, 100, 'Micro Crude'],
+  CL:  [0.01, 100, 'Micro Crude (MCL)'],
+  SI:  [0.005, 1000, 'Micro Silver (SIL)'],
+  HG:  [0.0005, 2500, 'Micro Copper (MHG)'],
+  // FX: micros exist for euro, pound, aussie only
+  '6E': [0.0001, 12500, 'Micro Euro (M6E)'],
+  '6B': [0.0001, 6250,  'Micro Pound (M6B)'],
+  '6A': [0.0001, 10000, 'Micro Aussie (M6A)'],
+  '6J': [0.0000005, 12500000, 'Yen — NO MICRO, full size'],
+  '6N': [0.00005, 100000,     'Kiwi — NO MICRO, full size'],
+  '6S': [0.0001, 125000,      'Franc — NO MICRO, full size'],
+  '6C': [0.00005, 100000,     'CAD — NO MICRO, full size'],
+  // softs
+  SB: [0.01, 1120, 'Sugar — NO MICRO, full size'],
+};
+const specOf = (s) => SPEC[s.replace(/(2y|y|live|now|h)$/, '')] ?? [0.25, 2, '?'];
 
 const body = (b) => Math.abs(b.close - b.open);
 const isGreen = (b) => b.close > b.open;
@@ -165,7 +192,11 @@ function detectZoneAt(h, atrH, i) {
 const overlap = (a, b) => a.bot <= b.top && b.bot <= a.top;
 
 // ---- per-symbol prepared data, cached across configs --------------------------
-const ZONE_TF_SET = [60, 15, 5];   // the original always runs 60M, 15M, 5M and CT
+// The original script always runs 60M, 15M, 5M and CT. But that is a day-trading zone
+// book. The method this strategy comes from is a SWING method: daily and 4-hour zones,
+// entered on 4-hour or hourly. ZONETFS makes the zone book configurable so the higher
+// timeframe version can actually be measured instead of assumed.
+const ZONE_TF_SET = (process.env.ZONETFS || '60,15,5').split(',').map(Number);
 
 function prepare(sym, from, to, warmup) {
   let m1;
@@ -243,6 +274,10 @@ function run(S, sym, cfg, from) {
   const T = (cfg.ctx === 'htfcandle' || cfg.ctx === 'hhll') ? trendFor(S, htfMin, cfg.leg || 3) : null;
   let hi = 0, hLast = null, ei = 0, hhllDir = 0;
 
+  const F = { zonesMade: 0, seen: 0, used: 0, alive: 0, weak: 0, longBase: 0, strong: 0,
+    notNested: 0, nested: 0, noHtf: 0, wrongTrend: 0, trendOk: 0, tooWide: 0, behind: 0, candidate: 0,
+    bars: 0, hasPend: 0, pendMoved: 0 };
+  let prevPendEntry = null;
   let live = [], pos = null; const trades = [];
   // ONEORDER mirrors what the Pine strategy can actually do: hold ONE resting limit at a
   // time, chosen at the close of each bar as the nearest qualifying zone, and fill only
@@ -255,11 +290,13 @@ function run(S, sym, cfg, from) {
   for (let i = 1; i < ct.length; i++) {
     const b = ct[i], A = atrCt[i];
     if (A == null || emaS[i] == null) continue;
+    F.bars++;
 
     for (const st of streams) {
       while (st.ptr < st.created.length && st.created[st.ptr].createdAt <= b.time) {
         const z = { ...st.created[st.ptr++], used: 0 };
         if (!live.some((q) => q.label === z.label && overlap(q, z))) {
+          F.zonesMade++;
           live.unshift(z); if (live.length > P.max_zones) live.pop();
         }
       }
@@ -290,10 +327,16 @@ function run(S, sym, cfg, from) {
         const px = hitSL ? pos.stop : hitTP ? pos.tp : b.close;
         const exit = long ? px - tick : px + tick;
         const r = (long ? exit - pos.fill : pos.fill - exit) / pos.risk;
+        // contracts sized so the dollar risk lands as close to the budget as a whole
+        // number of lots allows, never rounding up past it
+        const lots = cfg.riskUsd ? Math.max(1, Math.floor(cfg.riskUsd / (pos.risk * pv))) : 1;
         trades.push({ sym, dir: pos.side, zoneTf: pos.label,
-          date: new Date(pos.t * 1000).toISOString().slice(0, 10), entryTime: pos.t,
+          date: new Date(pos.t * 1000).toISOString().slice(0, 16).replace('T', ' '), entryTime: pos.t,
+          entry: Number(pos.entry.toFixed(4)), stop: Number(pos.stop.toFixed(4)),
+          target: Number(pos.tp.toFixed(4)), riskPts: Number(pos.risk.toFixed(4)),
           res: hitSL ? 'STOP' : hitTP ? 'TARGET' : 'TIMEOUT',
-          r: Number(r.toFixed(4)), usd: Number((r * pos.risk * pv).toFixed(2)),
+          r: Number(r.toFixed(4)), lots, riskUsd: Number((pos.risk * pv * lots).toFixed(2)),
+          usd: Number((r * pos.risk * pv * lots).toFixed(2)),
           mfe: Number(pos.mfe.toFixed(3)) });
         pos = null;
       }
@@ -327,26 +370,44 @@ function run(S, sym, cfg, from) {
       pend = null;
       let best = Infinity;
       for (const z of live) {
+        F.seen++;
         if (!(b.time > z.legoutTime)) continue;
-        if (z.used) continue;
-        if (cfg.strongAtr && !(z.legStrength >= cfg.strongAtr)) continue;
-        if (cfg.maxBase && !(z.smallCount <= cfg.maxBase)) continue;
-        if (cfg.nested && !live.some((q) => q.rank > z.rank && q.type === z.type && z.top <= q.top && z.bot >= q.bot)) continue;
+        if (z.used) { F.used++; continue; }
+        F.alive++;
+        if (cfg.strongAtr && !(z.legStrength >= cfg.strongAtr)) { F.weak++; continue; }
+        if (cfg.maxBase && !(z.smallCount <= cfg.maxBase)) { F.longBase++; continue; }
+        F.strong++;
+        if (cfg.nested && !live.some((q) => q.rank > z.rank && q.type === z.type && z.top <= q.top && z.bot >= q.bot)) { F.notNested++; continue; }
+        F.nested++;
         const buy = z.type === 'Demand';
         if (cfg.ctx === 'trend') { if (buy ? !up : up) continue; }
-        else if (cfg.ctx === 'htfcandle') { if (!hLast) continue; const u = hLast.close > hLast.open; if (buy ? !u : u) continue; }
+        else if (cfg.ctx === 'htfcandle') { if (!hLast) { F.noHtf++; continue; } const u = hLast.close > hLast.open; if (buy ? !u : u) { F.wrongTrend++; continue; } }
+        F.trendOk++;
         const e = buy ? z.top : z.bot;
         const hgt = z.top - z.bot;
         const sl = buy ? z.bot - hgt * cfg.slPct : z.top + hgt * cfg.slPct;
         const risk = Math.abs(e - sl);
         if (!(risk > 0)) continue;
-        if (cfg.maxRiskAtr && !(risk <= A * cfg.maxRiskAtr)) continue;
+        // Dollar risk, not ATR. One contract of this instrument risks this many dollars
+        // on this stop; if that alone blows the budget the setup is untradeable at this
+        // account size no matter how good it looks.
+        const oneLot = risk * pv;
+        if (cfg.maxRiskUsd && oneLot > cfg.maxRiskUsd) { F.tooWide++; continue; }
+        if (cfg.maxRiskAtr && !(risk <= A * cfg.maxRiskAtr)) { F.tooWide++; continue; }
         if (buy ? !(sl < e) : !(sl > e)) continue;
         // the script only rests into a level price has not already passed through
-        if (buy ? !(b.close > e) : !(b.close < e)) continue;
+        if (buy ? !(b.close > e) : !(b.close < e)) { F.behind++; continue; }
+        F.candidate++;
         const d = Math.abs(b.close - e);
         if (d < best) { best = d; pend = { z, buy, entry: e, sl, risk, tp: buy ? e + cfg.rr * risk : e - cfg.rr * risk }; }
       }
+      // How stable is the resting order? A trader picks a level and waits. This engine,
+      // like the Pine, re-picks the NEAREST qualifying zone every single bar, so the order
+      // can hop to a different level bar after bar and only fills if price happens to be
+      // at whichever one it landed on. That is why two 90%-correlated instruments share
+      // almost none of their setups.
+      if (pend) { F.hasPend++; if (prevPendEntry !== null && pend.entry !== prevPendEntry) F.pendMoved++; prevPendEntry = pend.entry; }
+      else prevPendEntry = null;
       continue;
     }
     // --- end one-resting-order path ----------------------------------------------
@@ -429,6 +490,7 @@ function run(S, sym, cfg, from) {
       break;
     }
   }
+  if (process.env.FUNNEL === '1') console.error(`FUNNEL ${sym}: ` + JSON.stringify(F));
   return trades;
 }
 
@@ -478,7 +540,8 @@ if (process.argv[1].endsWith('simplezones.mjs')) {
     maxRiskAtr: Number(process.env.MAXRISK || 0), maxBars: Number(process.env.MAXBARS || 0),
     htf: Number(process.env.HTF || 60), leg: Number(process.env.LEG || 3),
     maxTouch: Number(process.env.MAXTOUCH || 1), entryBar: process.env.ENTRYBAR === '1',
-    fillThru: Number(process.env.FILLTHRU || 0), oneOrder: process.env.ONEORDER === '1' };
+    fillThru: Number(process.env.FILLTHRU || 0), oneOrder: process.env.ONEORDER === '1',
+    riskUsd: Number(process.env.RISK_USD || 0), maxRiskUsd: Number(process.env.MAXRISK_USD || 0) };
   const t = runAll(cfg);
   writeFileSync(process.env.OUT || '/tmp/sz.json', JSON.stringify(t));
   const s = stats(t);

@@ -60,10 +60,19 @@ const body = (b) => Math.abs(b.close - b.open);
 const isGreen = (b) => b.close > b.open;
 const isRed = (b) => b.close < b.open;
 
-function aggregate(m1, sec) {
+/**
+ * Aggregate to a higher timeframe.
+ *
+ * `off` shifts the bucket boundary. Flooring to UTC midnight is wrong for futures:
+ * TradingView anchors daily and 4-hour bars to the EXCHANGE SESSION, which for CME
+ * opens 18:00 New York, about 22:00 UTC. Six hours of offset moves every daily bar,
+ * which moves every daily zone, which changes which 1-hour zones pass the nesting
+ * test. That is a different strategy, not a rounding detail.
+ */
+function aggregate(m1, sec, off = 0) {
   const out = []; let cur = null;
   for (const [t, o, h, l, c] of m1) {
-    const k = Math.floor(t / sec) * sec;
+    const k = Math.floor((t - off) / sec) * sec + off;
     if (!cur || cur.time !== k) { if (cur) out.push(cur); cur = { time: k, open: o, high: h, low: l, close: c, end: t }; }
     else { cur.high = Math.max(cur.high, h); cur.low = Math.min(cur.low, l); cur.close = c; cur.end = t; }
   }
@@ -207,7 +216,9 @@ function prepare(sym, from, to, warmup) {
 }
 function barsFor(S, mins) {
   if (!S.ct.has(mins)) {
-    const bars = aggregate(S.m1, mins * 60);
+    // Intraday buckets under an hour need no offset; from 1 hour up the session anchor
+    // matters, and at daily it dominates.
+    const bars = aggregate(S.m1, mins * 60, mins >= 60 ? SESSION_OFF : 0);
     S.ct.set(mins, { bars, atr: atrSeries(bars, P.atr_length),
       emaF: emaSeries(bars, P.ema_fast_len), emaS: emaSeries(bars, P.ema_slow_len),
       rsi: rsiSeries(bars, 14) });
@@ -520,6 +531,10 @@ const SYMS = (process.env.SYMS || 'MNQ2y,MES2y,MYM2y,M2K2y,MGC2y').split(',');
 // PINEMTF=1 models request.security's once-per-chart-bar delivery. Default ON, because
 // off is simply wrong: it describes a script nobody is running.
 const PINEMTF = process.env.PINEMTF !== '0';
+// Seconds past UTC midnight where the exchange session starts. CME futures open
+// 18:00 New York, which is 22:00 UTC in winter and 21:00 in summer; 22:00 is the
+// closer single constant and DST drift is one hour on a 24-hour bar.
+const SESSION_OFF = Number(process.env.SESSION_OFF ?? 79200);
 
 export function runAll(cfg, syms = SYMS, from = FROM, to = TO) {
   const out = [];

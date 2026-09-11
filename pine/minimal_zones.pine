@@ -255,7 +255,12 @@ var float pendEntry = na
 var float pendStop = na
 var float pendTp = na
 var bool  pendLong = false
-var int   pendIdx = -1
+// Hold the ZONE ITSELF, never its array index. array.unshift puts new zones at the
+// front, shifting every index by one, and breached zones are removed. An index captured
+// when the order was placed therefore points at a different zone by the time it fills,
+// so the traded zone was never marked used and could be taken again and again.
+// TradingView's own trade list showed gold entered at 4417.2 twice, which is that bug.
+var Zone  pendZone = na
 var line  pendLine = na
 
 // The open position, drawn as two boxes: RED from entry down to the stop, GREEN from
@@ -277,7 +282,7 @@ nestedOk(Zone z) =>
 
 if strategy.position_size == 0 and barstate.isconfirmed and not na(atrCt)
     pendEntry := na
-    pendIdx := -1
+    pendZone := na
     float bestDist = 1e20
     if array.size(zones) > 0
         for i = 0 to array.size(zones) - 1
@@ -296,7 +301,7 @@ if strategy.position_size == 0 and barstate.isconfirmed and not na(atrCt)
                         pendStop  := sl
                         pendTp    := z.dem ? e + targetR * rk : e - targetR * rk
                         pendLong  := z.dem
-                        pendIdx   := i
+                        pendZone  := z
     if not na(pendLine)
         line.delete(pendLine)
         pendLine := na
@@ -313,9 +318,8 @@ if strategy.position_size == 0 and barstate.isconfirmed and not na(atrCt)
 
 // the limit filled: mark the zone spent, set the exits, draw the position, emit the signal
 if strategy.position_size != 0 and strategy.position_size[1] == 0
-    if pendIdx >= 0 and pendIdx < array.size(zones)
-        Zone zz = array.get(zones, pendIdx)
-        zz.used := true
+    if not na(pendZone)
+        pendZone.used := true
     strategy.exit(strategy.position_size > 0 ? "L" : "S", stop=pendStop, limit=pendTp)
     if markPosition
         if not na(mRisk)

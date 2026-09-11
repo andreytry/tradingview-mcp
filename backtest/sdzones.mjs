@@ -35,7 +35,16 @@ const ZONE_TFS = (process.env.ZONE_TFS || '60,15,5,CT').split(',').map((x) => x.
 const USE_RSI = process.env.RSI === '1';
 const TREND   = process.env.TREND || 'ct';
 const DOUBLE  = process.env.DOUBLE === '1';
+// NOBE=1 turns off update_break_even_stop. Not part of the script — a diagnostic, because
+// moving the stop to entry at 1R converts a large share of winners into scratches and can
+// hide whether the SIGNAL has any edge.
+const NO_BE   = process.env.NOBE === '1';
 const OUT     = process.env.OUT || '/tmp/sd.json';
+// Evaluation window. Zones and EMAs still warm up on WARMUP_D days of bars before FROM,
+// so a windowed run sees exactly the same zone book as a full-history run at that date.
+const FROM    = process.env.FROM ? Date.parse(process.env.FROM + 'T00:00:00Z') / 1000 : null;
+const TO      = process.env.TO   ? Date.parse(process.env.TO   + 'T00:00:00Z') / 1000 : null;
+const WARMUP  = Number(process.env.WARMUP_D || 45) * 86400;
 
 // --- script inputs, at the values set on the live chart -----------------------
 const P = {
@@ -214,6 +223,12 @@ for (const sym of SYMS) {
   let m1;
   try { m1 = JSON.parse(readFileSync(`${D}/${sym}_1m.json`)); }
   catch { console.log(`${sym}: no data`); continue; }
+  if (FROM || TO) {
+    const lo = FROM ? FROM - WARMUP : -Infinity;
+    const hi = TO || Infinity;
+    m1 = m1.filter((r) => r[0] >= lo && r[0] <= hi);
+    if (!m1.length) { console.log(`${sym}: no bars in window`); continue; }
+  }
   const [tick, pv] = specOf(sym);
 
   const ct  = aggregate(m1, CT_MIN * 60);
@@ -284,7 +299,11 @@ for (const sym of SYMS) {
 
     if (pos) {
       const long = pos.side === 'LONG';
-      if (!pos.be) {
+      // MFE/MAE in R, measured on the raw path and independent of stop/target, so the
+      // quality of the ENTRY can be judged separately from the exit scheme.
+      pos.mfe = Math.max(pos.mfe, (long ? b.high - pos.fill : pos.fill - b.low) / pos.risk);
+      pos.mae = Math.max(pos.mae, (long ? pos.fill - b.low : b.high - pos.fill) / pos.risk);
+      if (!pos.be && !NO_BE) {
         const oneR = long ? pos.entry + pos.risk : pos.entry - pos.risk;
         if (long ? b.high >= oneR : b.low <= oneR) { pos.stop = pos.entry; pos.be = true; }
       }
@@ -298,11 +317,13 @@ for (const sym of SYMS) {
           date: new Date(pos.t * 1000).toISOString().slice(0, 10), entryTime: pos.t,
           entry: pos.entry, stop: pos.stop0, tp: pos.tp, R: pos.risk,
           res: hitSL ? 'STOP' : 'TARGET', r: Number(r.toFixed(4)),
+          mfe: Number(pos.mfe.toFixed(3)), mae: Number(pos.mae.toFixed(3)),
           usd: Number((r * pos.risk * pv).toFixed(2)), exitT: b.time });
         pos = null; nTrades++;
       }
     }
     if (pos) continue;
+    if (FROM && b.time < FROM) continue;   // warm-up bars build zones but take no trades
 
     const ctUp = emaF[i] > emaS[i];
     const green = isGreen(b), red = isRed(b);
@@ -360,7 +381,7 @@ for (const sym of SYMS) {
         entry: b.close, fill: sig === 'B' ? b.close + tick : b.close - tick,
         stop: sl, stop0: sl, risk,
         tp: sig === 'B' ? b.close + P.target_rr * risk : b.close - P.target_rr * risk,
-        be: false };
+        be: false, mfe: 0, mae: 0 };
       break;
     }
   }

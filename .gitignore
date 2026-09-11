@@ -6,3 +6,4 @@ temp_*
 discovery-log.json
 rules.json
 backtest-data/
+transcripts/

@@ -71,6 +71,51 @@ function rsiSeries(bars, len = 14) {
   return o;
 }
 
+// ---- trend definitions -------------------------------------------------------
+// Pivot swings with lookleft/lookright = LR. A bar is a swing high if its high is the
+// highest across the 2*LR+1 window centred on it. Confirmed only LR bars later, which is
+// why the timeline below records the CONFIRMATION time, not the pivot time.
+function swings(bars, LR = 2) {
+  const hi = [], lo = [];
+  for (let i = LR; i < bars.length - LR; i++) {
+    let isH = true, isL = true;
+    for (let k = i - LR; k <= i + LR; k++) {
+      if (k === i) continue;
+      if (bars[k].high >= bars[i].high) isH = false;
+      if (bars[k].low <= bars[i].low) isL = false;
+    }
+    if (isH) hi.push({ i, at: bars[i + LR].end, v: bars[i].high });
+    if (isL) lo.push({ i, at: bars[i + LR].end, v: bars[i].low });
+  }
+  return { hi, lo };
+}
+
+// HH/LL trend: LEG consecutive higher highs AND higher lows = up; lower lows and lower
+// highs = down; anything else = no trend. Returns events {at, dir} in time order.
+function hhllTimeline(bars, LEG = 3, LR = 2) {
+  const { hi, lo } = swings(bars, LR);
+  const ev = [];
+  const all = [...hi.map((x) => ({ ...x, k: 'h' })), ...lo.map((x) => ({ ...x, k: 'l' }))]
+    .sort((a, b) => a.at - b.at);
+  const H = [], L = [];
+  for (const s of all) {
+    (s.k === 'h' ? H : L).push(s.v);
+    let dir = 0;
+    if (H.length > LEG && L.length > LEG) {
+      let up = true, dn = true;
+      for (let n = 0; n < LEG; n++) {
+        if (!(H.at(-1 - n) > H.at(-2 - n))) up = false;
+        if (!(L.at(-1 - n) > L.at(-2 - n))) up = false;
+        if (!(H.at(-1 - n) < H.at(-2 - n))) dn = false;
+        if (!(L.at(-1 - n) < L.at(-2 - n))) dn = false;
+      }
+      dir = up ? 1 : dn ? -1 : 0;
+    }
+    ev.push({ at: s.at, dir });
+  }
+  return ev;
+}
+
 // ---- VERBATIM from sdzones.mjs ------------------------------------------------
 function detectZoneAt(h, atrH, i) {
   const at = (k) => h[i - k];
@@ -138,6 +183,15 @@ function barsFor(S, mins) {
   }
   return S.ct.get(mins);
 }
+function trendFor(S, mins, leg) {
+  const key = `${mins}:${leg}`;
+  if (!S.trend) S.trend = new Map();
+  if (!S.trend.has(key)) {
+    const { bars } = barsFor(S, mins);
+    S.trend.set(key, { candle: bars, hhll: hhllTimeline(bars, leg, 2) });
+  }
+  return S.trend.get(key);
+}
 function zonesFor(S, mins, label) {
   const key = mins;
   if (!S.zones.has(key)) {
@@ -157,6 +211,11 @@ function run(S, sym, cfg, from) {
   const streams = tfs.map((m) => ({ mins: m, label: m === cfg.ct ? 'CT' : `${m}M`,
     created: zonesFor(S, m, m === cfg.ct ? 'CT' : `${m}M`), ptr: 0 }));
 
+  // HTF trend state, advanced bar by bar so nothing from the future is read.
+  const htfMin = cfg.htf || 60;
+  const T = (cfg.ctx === 'htfcandle' || cfg.ctx === 'hhll') ? trendFor(S, htfMin, cfg.leg || 3) : null;
+  let hi = 0, hLast = null, ei = 0, hhllDir = 0;
+
   let live = [], pos = null; const trades = [];
   for (let i = 1; i < ct.length; i++) {
     const b = ct[i], A = atrCt[i];
@@ -164,11 +223,15 @@ function run(S, sym, cfg, from) {
 
     for (const st of streams) {
       while (st.ptr < st.created.length && st.created[st.ptr].createdAt <= b.time) {
-        const z = st.created[st.ptr++];
+        const z = { ...st.created[st.ptr++], used: 0 };
         if (!live.some((q) => q.label === z.label && overlap(q, z))) {
           live.unshift(z); if (live.length > P.max_zones) live.pop();
         }
       }
+    }
+    if (T) {
+      while (hi < T.candle.length && T.candle[hi].end <= b.time) hLast = T.candle[hi++];
+      while (ei < T.hhll.length && T.hhll[ei].at <= b.time) hhllDir = T.hhll[ei++].dir;
     }
     live = live.filter((z) => {
       const amt = (z.top - z.bot) * P.breach_threshold;
@@ -224,7 +287,9 @@ function run(S, sym, cfg, from) {
       if (cfg.ctx === 'trend') { if (buy ? !up : up) continue; }
       else if (cfg.ctx === 'counter') { if (buy ? up : !up) continue; }
       else if (cfg.ctx === 'rsirev') { const v = rsi[i]; if (v == null) continue; if (buy ? !(v <= cfg.rsiLo) : !(v >= cfg.rsiHi)) continue; }
-      else if (cfg.ctx === 'rsimid') { const v = rsi[i]; if (v == null) continue; if (buy ? !(v >= 40 && v <= 60) : !(v >= 40 && v <= 60)) continue; }
+      else if (cfg.ctx === 'rsimid') { const v = rsi[i]; if (v == null) continue; if (!(v >= 40 && v <= 60)) continue; }
+      else if (cfg.ctx === 'htfcandle') { if (!hLast) continue; const up2 = hLast.close > hLast.open; if (buy ? !up2 : up2) continue; }
+      else if (cfg.ctx === 'hhll') { if (hhllDir === 0) continue; if (buy ? hhllDir !== 1 : hhllDir !== -1) continue; }
 
       // --- mechanics: entry, stop, target ---
       const hgt = z.top - z.bot;
@@ -233,6 +298,10 @@ function run(S, sym, cfg, from) {
       const risk = Math.abs(entry - sl);
       if (!(risk > 0)) continue;
       if (cfg.maxRiskAtr && !(risk <= A * cfg.maxRiskAtr)) continue;
+      // A zone is tradable only cfg.maxTouch times in its life. Without this the engine
+      // re-enters the same level on every bar price sits at its edge.
+      if (cfg.maxTouch && z.used >= cfg.maxTouch) continue;
+      z.used++;
       if (buy ? !(sl < entry) : !(sl > entry)) continue;
       pos = { side: buy ? 'LONG' : 'SHORT', t: b.time, i, label: z.label, entry,
         fill: buy ? entry + tick : entry - tick, stop: sl, risk,
@@ -283,7 +352,9 @@ if (process.argv[1].endsWith('simplezones.mjs')) {
     ctx: process.env.CTX || 'none', rsiLo: Number(process.env.RSILO || 35), rsiHi: Number(process.env.RSIHI || 65),
     trigger: process.env.TRIGGER || 'reject', slPct: Number(process.env.SLPCT || 0.3),
     rr: Number(process.env.RR || 1.5), be: Number(process.env.BE || 0),
-    maxRiskAtr: Number(process.env.MAXRISK || 0), maxBars: Number(process.env.MAXBARS || 0) };
+    maxRiskAtr: Number(process.env.MAXRISK || 0), maxBars: Number(process.env.MAXBARS || 0),
+    htf: Number(process.env.HTF || 60), leg: Number(process.env.LEG || 3),
+    maxTouch: Number(process.env.MAXTOUCH || 1) };
   const t = runAll(cfg);
   writeFileSync(process.env.OUT || '/tmp/sz.json', JSON.stringify(t));
   const s = stats(t);

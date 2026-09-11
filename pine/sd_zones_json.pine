@@ -1,0 +1,975 @@
+//@version=5
+// TI-3: B/S strict zone-touch rules — ONLY set B/S when extremes meet the specified inside/outside conditions
+//TI-46 B and S fix
+
+// TI-3: NOTE — Only the requested changes were made and are marked with TI-3 comments.
+// Never changed the indicator name or unrelated logic.
+
+// TI-52: Enable intra-candle (on-tick) B/S evaluation — zones remain per-candle
+strategy("Supply/Demand Zones with Zone Arrival/Departure Alerts",overlay=true,max_boxes_count=500,pyramiding=0,calc_on_every_tick=true)
+
+// === Constants ===
+HISTORY_LENGTH = 500
+
+// === Zones UI ===
+group_zones = "Zones"
+show_ct = input.bool(true,"Current Timeframe",group=group_zones)
+show_5 = input.bool(true,"M5",group=group_zones,inline="ZSEL")
+show_15 = input.bool(true,"M15",group=group_zones,inline="ZSEL")
+show_60 = input.bool(true,"M60",group=group_zones,inline="ZSEL")
+
+// === Timeframe Configuration ===
+analysis_timeframe = input.timeframe(defval="60",title="Analysis Timeframe",tooltip="Timeframe to analyze for zones")
+
+// === Inputs (UI Settings) ===
+group_params = "Detection Settings"
+initial_length = input.int(100,"Initial Zone Length (bars)",group=group_params)
+days_back = input.int(100,"Draw Zones For Last N Days",group=group_params)
+atr_length = input.int(14,"ATR Period",group=group_params)
+long_atr_filter = input.float(0.5,"Long Current Candle min body as % of ATR",step=0.01,group=group_params)
+max_long_short_ratio = input.float(0.5,"Max Long/Short Ratio for small candles",step=0.01,group=group_params)
+leg_out_leg_in_ratio = input.float(0.25,"Leg Out/Leg In Ratio",step=0.01,group=group_params)
+breach_threshold = input.float(0.25,"Breach Threshold (% of zone height)",step=0.1,tooltip="How much price must penetrate zone to consider it breached",group=group_params)
+max_small_candles = input.int(10,"Max Small Candles in Zone",minval=1,maxval=50,group=group_params)
+max_wick_ratio = input.float(10,"Max wick length to body ratio",step=0.01,group=group_params)
+max_zones = input.int(200,"Max Active Zones",minval=10,maxval=200,group=group_params)
+range_mult = input.float(5.0,"Zone distance filter (× Daily Range)",step=0.1,group=group_params)
+
+// === TI-7: Rejection candle body threshold input (× ATR) ===
+rejection_atr_mult = input.float(0.5,"Rejection Candle Min Body (× ATR)",minval=0.0,step=0.05,group=group_params)
+
+// === TI-26: Separate toggles
+show_entries = input.bool(true,"Show entries",group=group_params)
+exec_strategy = input.bool(false,"Execute strategy",group=group_params)
+
+// === TI-40: Visualization controls ===
+group_vis = "Visualization"
+visualize_positions = input.bool(true,"Visualize Positions",group=group_vis)
+target_rr = input.float(1.5,"Target RR (R)",minval=0.1,step=0.1,group=group_vis)
+
+// === TI-33: Trend EMA settings (CT uses these) ===
+ema_fast_len = input.int(20,"Trend EMA Fast (CT)",minval=1,group=group_params)
+ema_slow_len = input.int(50,"Trend EMA Slow (CT)",minval=1,group=group_params)
+
+// === TI-9: Stop loss distance as % of zone height (outside the zone)
+sl_zone_pct = input.float(0.30,"Stoploss distance percent of zone size",minval=0.0,step=0.01,group=group_params)
+
+// [US-TI-43] Max risk gate: if |entry-stop| exceeds ATR × multiplier, skip the entry
+max_position_atr_mult = input.float(1.0,"Max Position Risk (× ATR)",minval=0.1,step=0.1,group=group_params)
+
+// TI-36: Position in the direction of trend VERSION4 — toggle updated (default OFF) and tooltip explains next-HTF live candle filter
+follow_strong_trend = input.bool(false,"Follow strong trend",group=group_params,tooltip="When ON: allow only LONG if the NEXT higher timeframe live candle is GREEN; allow only SHORT if it is RED. Mapping: 1→60, 5→60, 15→240, 60→240, 240→D, D→W. Uses live (unfinished) candles and may repaint.") // [TI-36] D→W
+
+// [TI-36] NEW: Take only in the direction of CT trend (LONG on CT green, SHORT on CT red)
+take_only_ct_trend = input.bool(true,"Take only in the direction of trend",group=group_params,tooltip="When ON: allow LONG only if CT trend is up (green) and SHORT only if CT trend is down (red).") // [TI-36]
+
+// TI-3: EMA Proximity (ATR) gate — used as a feature toggle and ATR-based tolerance
+ema_proximity_atr = input.float(-1.0,"EMA Proximity (ATR)",step=0.05,group=group_params) // TI-3
+
+// === [TI-35] RSI-gate inputs ===
+use_rsi_filter = input.bool(false,"RSI filter",group=group_params) // [TI-35]
+rsi_threshold = input.float(50.0,"RSI Threshold",minval=0.0,maxval=100.0,step=0.1,group=group_params) // [TI-35]
+
+// === [TI-50] New toggle: enter only on zone retest (suppress signals on formation)
+enter_only_on_retest = input.bool(false,"Enter only on return to a zone",group=group_params,tooltip="When ON: do not create B/S signals on the bar a zone is formed. Signals only appear on subsequent retests when all existing conditions are met.") // [TI-50]
+// Declared LAST on purpose. Pine numbers inputs by declaration order, so adding this
+// anywhere earlier would renumber every input after it and silently break every armed
+// alert, which snapshots input values at creation time.
+webhook_secret = input.string("","Webhook secret",group=group_params,tooltip="Shared secret the backend checks. Set it in the study settings; never commit it.")
+
+// === Helpers for MTF data ===
+body_size_mtf(_open,_close) => math.abs(_close - _open)
+is_green_mtf(_open,_close) => _close > _open
+is_red_mtf(_open,_close) => _close < _open
+
+// === Zone tracking type ===
+type ZoneData
+    box zone_box
+    float top
+    float bottom
+    string zone_type
+    int creation_bar_time
+    string tf_label
+    string label_text
+    int small_cnt
+    int legout_time
+
+// === Arrays to store zone data ===
+var array<ZoneData> active_zones = array.new<ZoneData>()
+
+// === Historical data storage (60M) ===
+var array<float> mtf_open_history_60 = array.new<float>()
+var array<float> mtf_high_history_60 = array.new<float>()
+var array<float> mtf_low_history_60 = array.new<float>()
+var array<float> mtf_close_history_60 = array.new<float>()
+var array<float> mtf_atr_history_60 = array.new<float>()
+var array<int> mtf_time_history_60 = array.new<int>()
+
+// === Historical data storage (15M) ===
+var array<float> mtf_open_history_15 = array.new<float>()
+var array<float> mtf_high_history_15 = array.new<float>()
+var array<float> mtf_low_history_15 = array.new<float>()
+var array<float> mtf_close_history_15 = array.new<float>()
+var array<float> mtf_atr_history_15 = array.new<float>()
+var array<int> mtf_time_history_15 = array.new<int>()
+
+// === Historical data storage (5M) ===
+var array<float> mtf_open_history_5 = array.new<float>()
+var array<float> mtf_high_history_5 = array.new<float>()
+var array<float> mtf_low_history_5 = array.new<float>()
+var array<float> mtf_close_history_5 = array.new<float>()
+var array<float> mtf_atr_history_5 = array.new<float>()
+var array<int> mtf_time_history_5 = array.new<int>()
+
+// === Historical data storage (Current Timeframe) ===
+var array<float> mtf_open_history_ct = array.new<float>()
+var array<float> mtf_high_history_ct = array.new<float>()
+var array<float> mtf_low_history_ct = array.new<float>()
+var array<float> mtf_close_history_ct = array.new<float>()
+var array<float> mtf_atr_history_ct = array.new<float>()
+var array<int> mtf_time_history_ct = array.new<int>()
+
+// === Daily range ===
+[dHighD,dLowD] = request.security(syminfo.tickerid,"D",[high,low],lookahead=barmerge.lookahead_off)
+daily_range = dHighD - dLowD
+
+// === Global ATR ===
+atr_ct = ta.atr(atr_length)
+
+// === [TI-35] RSI-gate calc ===
+rsi_value = ta.rsi(close,14) // [TI-35]
+rsi_gate_ok(sig) => not use_rsi_filter ? true : (sig == "B" ? (rsi_value < rsi_threshold) : (rsi_value >= rsi_threshold)) // [TI-35]
+
+// TI-3: CT EMAs for proximity/stack checks + major EMAs
+ema_fast_ct = ta.ema(close,ema_fast_len) // TI-3
+ema_slow_ct = ta.ema(close,ema_slow_len) // TI-3
+ema50_ct = ta.ema(close,50) // TI-3
+ema100_ct = ta.ema(close,100) // TI-3
+ema200_ct = ta.ema(close,200) // TI-3
+
+// === [TI-39] Unified Trend Indicator (SINGLE source of truth)
+// CT: EMA cross (as is). H1/H4: Δ over ~1h/~4h using the CURRENT timeframe bars.
+// D1/W: live candle color via security (as before).
+tf_sec = timeframe.in_seconds() // [TI-39]
+int bars_1h = math.max(1, int(math.round(3600.0 / tf_sec))) // [TI-39]
+int bars_4h = math.max(1, int(math.round(14400.0 / tf_sec))) // [TI-39]
+
+float h1_start = na(open[bars_1h]) ? open : open[bars_1h] // [TI-39]
+float h4_start = na(open[bars_4h]) ? open : open[bars_4h] // [TI-39]
+float h1_delta = close - h1_start // [TI-39]
+float h4_delta = close - h4_start // [TI-39]
+
+[oD_o,oD_c] = request.security(syminfo.tickerid,"D",[open,close],lookahead=barmerge.lookahead_on) // [TI-39]
+[oW_o,oW_c] = request.security(syminfo.tickerid,"W",[open,close],lookahead=barmerge.lookahead_on) // [TI-39]
+
+bool ct_up_trend = ta.ema(close,ema_fast_len) > ta.ema(close,ema_slow_len) // [TI-39]
+bool h1_up_trend = h1_delta >= 0 // [TI-39]
+bool h4_up_trend = h4_delta >= 0 // [TI-39]
+bool d1_up_trend = oD_c > oD_o // [TI-39]
+bool w_up_trend  = oW_c > oW_o // [TI-39]
+
+// For backward compatibility with existing gates/widgets, reuse the same variable names:
+h1_up_live = h1_up_trend // [TI-39]
+h4_up_live = h4_up_trend // [TI-39]
+d1_up_live = d1_up_trend // [TI-39]
+w_up_live  = w_up_trend  // [TI-39]
+
+// TI-3: proximity helper (ATR × multiplier to EMA_FAST)
+is_within_ema_proximity(sig) =>
+    if ema_proximity_atr <= 0
+        true
+    else
+        bool green = close > open
+        bool red = close < open
+        bool ema_stack_up = ema_fast_ct > ema_slow_ct
+        float dist = math.abs(open - ema_fast_ct)
+        bool near = dist <= atr_ct * ema_proximity_atr
+        sig == "B" ? (green and ema_stack_up and near) : (red and ema_stack_up and near)
+
+// TI-3: Additional proximity to EMA50/EMA100/EMA200 when feature enabled
+is_near_any_major_ema() =>
+    float tol = atr_ct * ema_proximity_atr
+    bool near50 = math.abs(open - ema50_ct) <= tol
+    bool near100 = math.abs(open - ema100_ct) <= tol
+    bool near200 = math.abs(open - ema200_ct) <= tol
+    near50 or near100 or near200
+
+// TI-3: H1 & H4 alignment gate when feature enabled — now powered by the unified indicator
+htf_trend_alignment_ok(sig) => // [TI-39]
+    sig == "B" ? (h1_up_live and h4_up_live) : ((not h1_up_live) and (not h4_up_live)) // [TI-39]
+
+// TI-3: S gating when EMA_FAST < EMA_SLOW (supply-context confirmation)
+supply_short_gate(zone_top,zone_bottom) =>
+    bool ema_stack_down = ema_fast_ct < ema_slow_ct
+    bool red = close < open
+    float body = math.abs(close - open)
+    bool open_in_zone = open <= zone_top and open >= zone_bottom
+    bool body_ok = body >= atr_ct * rejection_atr_mult
+    bool ema_in_zone = ((ema_fast_ct <= zone_top and ema_fast_ct >= zone_bottom) or (ema_slow_ct <= zone_top and ema_slow_ct >= zone_bottom))
+    ema_stack_down and red and open_in_zone and body_ok and ema_in_zone
+
+// Helper: current-range check
+is_zone_in_range(_top,_bottom) =>
+    float mid = (_top + _bottom) * 0.5
+    float denom = math.max(daily_range,syminfo.mintick)
+    float norm = math.abs(close - mid) / denom
+    norm <= range_mult
+
+// === Breach check ===
+is_zone_breached(zone_data) =>
+    float zone_height = zone_data.top - zone_data.bottom
+    float breach_amount = zone_height * breach_threshold
+    zone_data.zone_type == "Supply" ? high > zone_data.top + breach_amount : low < zone_data.bottom - breach_amount
+
+// === SAFE HELPERS ===
+diag_oob(where,idx,sz) => label.new(bar_index,high,where+" idx="+str.tostring(idx)+" size="+str.tostring(sz),style=label.style_label_left,textcolor=color.black,color=color.yellow,size=size.tiny)
+idx_in_bounds_float(arr,idx,where) =>
+    int sz = array.size(arr)
+    bool ok = idx >= 0 and idx < sz
+    if not ok
+        diag_oob(where,idx,sz)
+    ok
+idx_in_bounds_int(arr,idx,where) =>
+    int sz = array.size(arr)
+    bool ok = idx >= 0 and idx < sz
+    if not ok
+        diag_oob(where,idx,sz)
+    ok
+idx_in_bounds_str(arr,idx,where) =>
+    int sz = array.size(arr)
+    bool ok = idx >= 0 and idx < sz
+    if not ok
+        diag_oob(where,idx,sz)
+    ok
+idx_in_bounds_zone(arr,idx,where) =>
+    int sz = array.size(arr)
+    bool ok = idx >= 0 and idx < sz
+    if not ok
+        diag_oob(where,idx,sz)
+    ok
+safe_get_float(arr,idx,where) => idx_in_bounds_float(arr,idx,where) ? array.get(arr,idx) : na
+safe_get_int(arr,idx,where) => idx_in_bounds_int(arr,idx,where) ? array.get(arr,idx) : na
+safe_get_str(arr,idx,where) => idx_in_bounds_str(arr,idx,where) ? array.get(arr,idx) : ""
+safe_get_zone(arr,idx,where) => idx_in_bounds_zone(arr,idx,where) ? array.get(arr,idx) : na
+
+// === VISUALS (entry→TP and entry→SL) ===
+var tp_box_arr = array.new_box()
+var sl_box_arr = array.new_box()
+var entry_line_ar = array.new_line()
+var entry_lbl_arr = array.new_label()
+if barstate.isfirst
+    array.push(tp_box_arr,na)
+    array.push(sl_box_arr,na)
+    array.push(entry_line_ar,na)
+    array.push(entry_lbl_arr,na)
+
+delete_pos_boxes() =>
+    box tb = array.get(tp_box_arr,0)
+    if not na(tb)
+        box.delete(tb)
+        array.set(tp_box_arr,0,na)
+    box sb = array.get(sl_box_arr,0)
+    if not na(sb)
+        box.delete(sb)
+        array.set(sl_box_arr,0,na)
+    line ln = array.get(entry_line_ar,0)
+    if not na(ln)
+        line.delete(ln)
+        array.set(entry_line_ar,0,na)
+    label lb = array.get(entry_lbl_arr,0)
+    if not na(lb)
+        label.delete(lb)
+        array.set(entry_lbl_arr,0,na)
+
+// === Zone boundaries ===
+find_zone_boundaries_universal(start_idx,num_small_candles,zone_type,open_hist,high_hist,low_hist,close_hist) =>
+    float zone_top = na
+    float zone_bottom = na
+    if zone_type == "Demand"
+        float o1 = safe_get_float(open_hist,start_idx+1,"open_hist@bounds")
+        float c1 = safe_get_float(close_hist,start_idx+1,"close_hist@bounds")
+        float l0 = safe_get_float(low_hist,start_idx,"low_hist@bounds")
+        if not na(o1) and not na(c1) and not na(l0)
+            zone_top := math.max(o1,c1)
+            zone_bottom := l0
+        for i = 1 to num_small_candles
+            if start_idx + i < array.size(open_hist)
+                float oi = safe_get_float(open_hist,start_idx+i,"open_hist@loop")
+                float ci = safe_get_float(close_hist,start_idx+i,"close_hist@loop")
+                float li = safe_get_float(low_hist,start_idx+i,"low_hist@loop")
+                if not na(oi) and not na(ci) and not na(li)
+                    zone_top := math.max(zone_top,math.max(oi,ci))
+                    zone_bottom := math.min(zone_bottom,li)
+    else
+        float h0 = safe_get_float(high_hist,start_idx,"high_hist@bounds")
+        float o1 = safe_get_float(open_hist,start_idx+1,"open_hist@bounds")
+        float c1 = safe_get_float(close_hist,start_idx+1,"open_hist@bounds")
+        if not na(h0) and not na(o1) and not na(c1)
+            zone_top := h0
+            zone_bottom := math.min(o1,c1)
+        for i = 1 to num_small_candles
+            if start_idx + i < array.size(open_hist)
+                float hi = safe_get_float(high_hist,start_idx+i,"high_hist@loop")
+                float oi = safe_get_float(open_hist,start_idx+i,"open_hist@loop")
+                float ci = safe_get_float(close_hist,start_idx+i,"open_hist@loop")
+                if not na(hi) and not na(oi) and not na(ci)
+                    zone_top := math.max(zone_top,hi)
+                    zone_bottom := math.min(zone_bottom,math.min(oi,ci))
+    [zone_top,zone_bottom]
+
+// === Overlap detection (same TF) ===
+ti2_overlap(z1,z2) => not (z1.bottom > z2.top or z2.bottom > z1.top)
+
+// === Extend / cull + RANGE toggle ===
+update_zones() =>
+    if array.size(active_zones) > 0
+        int i = array.size(active_zones) - 1
+        while i >= 0
+            ZoneData z = safe_get_zone(active_zones,i,"active_zones@update_zones")
+            if na(z)
+                i -= 1
+                continue
+            if is_zone_breached(z)
+                if not na(z.zone_box)
+                    box.delete(z.zone_box)
+                array.remove(active_zones,i)
+                i -= 1
+                continue
+            bool in_range_now = is_zone_in_range(z.top,z.bottom)
+            if in_range_now and na(z.zone_box)
+                color zone_color = z.zone_type == "Demand" ? color.green : color.red
+                box bx = box.new(z.creation_bar_time,z.top,z.creation_bar_time,z.bottom,xloc=xloc.bar_time,extend=extend.right,border_color=zone_color,bgcolor=color.new(zone_color,85),text=z.label_text,text_color=zone_color,text_size=size.small)
+                ZoneData z2 = ZoneData.new(bx,z.top,z.bottom,z.zone_type,z.creation_bar_time,z.tf_label,z.label_text,z.small_cnt,z.legout_time)
+                array.set(active_zones,i,z2)
+            if (not in_range_now) and not na(z.zone_box)
+                box.delete(z.zone_box)
+                ZoneData z3 = ZoneData.new(na,z.top,z.bottom,z.zone_type,z.creation_bar_time,z.tf_label,z.label_text,z.small_cnt,z.legout_time)
+                array.set(active_zones,i,z3)
+            i -= 1
+
+// === Overlap culling per TF ===
+ti2_cull_overlaps_same_tf() =>
+    int i = 0
+    while i < array.size(active_zones)
+        ZoneData zi = safe_get_zone(active_zones,i,"active_zones@cull i")
+        if na(zi)
+            i += 1
+            continue
+        int j = i + 1
+        while j < array.size(active_zones)
+            ZoneData zj = safe_get_zone(active_zones,j,"active_zones@cull j")
+            if na(zj)
+                j += 1
+                continue
+            if zi.tf_label == zj.tf_label and ti2_overlap(zi,zj)
+                bool keep_i = zi.creation_bar_time <= zj.creation_bar_time
+                int remove_index = keep_i ? j : i
+                ZoneData zr = safe_get_zone(active_zones,remove_index,"active_zones@cull remove")
+                if not na(zr) and not na(zr.zone_box)
+                    box.delete(zr.zone_box)
+                array.remove(active_zones,remove_index)
+                if not keep_i
+                    if i < array.size(active_zones)
+                        zi := safe_get_zone(active_zones,i,"active_zones@cull refresh")
+                    j := i + 1
+                    continue
+                continue
+            else
+                j += 1
+        i += 1
+
+// === Position context (single source of truth) ===
+var pos_tf_label_arr = array.new_string()
+var pos_zone_type_arr = array.new_string()
+var pos_zone_top_arr = array.new_float()
+var pos_zone_bottom_arr = array.new_float()
+var pos_entry_id_arr = array.new_string()
+var pos_entry_px_arr = array.new_float()
+var pos_entry_time_arr = array.new_int()
+var pos_hit15_arr = array.new_bool()
+var pos_hitTarget_arr = array.new_bool()
+var pos_stop_px_arr = array.new_float()
+var pos_hitSL_arr = array.new_bool()
+var pos_side_arr = array.new_string()
+var pos_sl_moved_be_arr = array.new_bool()
+
+if barstate.isfirst
+    array.push(pos_tf_label_arr,"")
+    array.push(pos_zone_type_arr,"")
+    array.push(pos_zone_top_arr,na)
+    array.push(pos_zone_bottom_arr,na)
+    array.push(pos_entry_id_arr,"")
+    array.push(pos_entry_px_arr,na)
+    array.push(pos_entry_time_arr,na)
+    array.push(pos_hit15_arr,false)
+    array.push(pos_hitTarget_arr,false)
+    array.push(pos_stop_px_arr,na)
+    array.push(pos_hitSL_arr,false)
+    array.push(pos_side_arr,"")
+    array.push(pos_sl_moved_be_arr,false)
+
+set_position_context(tf_lbl,z_type,z_top,z_bottom,entry_id) =>
+    array.set(pos_tf_label_arr,0,tf_lbl)
+    array.set(pos_zone_type_arr,0,z_type)
+    array.set(pos_zone_top_arr,0,z_top)
+    array.set(pos_zone_bottom_arr,0,z_bottom)
+    array.set(pos_entry_id_arr,0,entry_id)
+    array.set(pos_entry_px_arr,0,close)
+    array.set(pos_entry_time_arr,0,time)
+    array.set(pos_hit15_arr,0,false)
+    array.set(pos_hitTarget_arr,0,false)
+    array.set(pos_stop_px_arr,0,na)
+    array.set(pos_hitSL_arr,0,false)
+    array.set(pos_side_arr,0,"")
+    array.set(pos_sl_moved_be_arr,0,false)
+
+clear_position_context() =>
+    array.set(pos_tf_label_arr,0,"")
+    array.set(pos_zone_type_arr,0,"")
+    array.set(pos_zone_top_arr,0,na)
+    array.set(pos_zone_bottom_arr,0,na)
+    array.set(pos_entry_id_arr,0,"")
+    array.set(pos_entry_px_arr,0,na)
+    array.set(pos_entry_time_arr,0,na)
+    array.set(pos_hit15_arr,0,false)
+    array.set(pos_hitTarget_arr,0,false)
+    array.set(pos_stop_px_arr,0,na)
+    array.set(pos_hitSL_arr,0,false)
+    array.set(pos_side_arr,0,"")
+    array.set(pos_sl_moved_be_arr,0,false)
+
+// === Virtual side helpers ===
+is_long_pos() => array.get(pos_side_arr,0) == "LONG"
+is_short_pos() => array.get(pos_side_arr,0) == "SHORT"
+is_flat_pos() => array.get(pos_side_arr,0) == ""
+
+// === [US-TI-44] Milestones from entry & initial zone-derived SL (stable even after SL=BE)
+update_profit_milestones() =>
+    float entry_px = array.get(pos_entry_px_arr,0)
+    float z_top = array.get(pos_zone_top_arr,0)
+    float z_bot = array.get(pos_zone_bottom_arr,0)
+    bool long_side = is_long_pos()
+    if not na(entry_px) and not na(z_top) and not na(z_bot) and (is_long_pos() or is_short_pos())
+        float zone_h = z_top - z_bot
+        float initial_sl = long_side ? z_bot - zone_h * sl_zone_pct : z_top + zone_h * sl_zone_pct
+        float risk_initial = math.abs(entry_px - initial_sl)
+        if risk_initial > 0
+            float tp_px = long_side ? entry_px + target_rr * risk_initial : entry_px - target_rr * risk_initial
+            bool now_reached = long_side ? high >= tp_px : low <= tp_px
+            if now_reached
+                array.set(pos_hit15_arr,0,true)
+                array.set(pos_hitTarget_arr,0,true)
+
+// === SL-hit detector (intrabar)
+update_stop_hit_flag() =>
+    float e = array.get(pos_entry_px_arr,0)
+    float s = array.get(pos_stop_px_arr,0)
+    if not na(e) and not na(s)
+        bool is_long = s < e
+        bool hit = (is_long and low <= s) or (not is_long and high >= s)
+        if hit
+            array.set(pos_hitSL_arr,0,true)
+
+// === TI-3: Move SL to BE at 1R progress (not 50%)
+update_break_even_stop() =>
+    string id = array.get(pos_entry_id_arr,0)
+    if id != "" and (is_long_pos() or is_short_pos())
+        float entry_px = array.get(pos_entry_px_arr,0)
+        float z_top = array.get(pos_zone_top_arr,0)
+        float z_bot = array.get(pos_zone_bottom_arr,0)
+        float stop_px = array.get(pos_stop_px_arr,0)
+        bool moved = array.get(pos_sl_moved_be_arr,0)
+        if not na(entry_px) and not na(z_top) and not na(z_bot) and not moved
+            bool long_side = is_long_pos()
+            float zone_h = z_top - z_bot
+            float initial_sl = long_side ? z_bot - zone_h * sl_zone_pct : z_top + zone_h * sl_zone_pct
+            float risk_initial = math.abs(entry_px - initial_sl)
+            if risk_initial > 0
+                float one_r_px = long_side ? entry_px + risk_initial : entry_px - risk_initial // TI-3
+                bool crossed = long_side ? high >= one_r_px : low <= one_r_px
+                if crossed
+                    array.set(pos_stop_px_arr,0,entry_px)
+                    array.set(pos_sl_moved_be_arr,0,true)
+                    if exec_strategy
+                        if long_side
+                            strategy.exit("LONG-SL",from_entry="LONG",stop=entry_px,comment=id)
+                        else
+                            strategy.exit("SHORT-SL",from_entry="SHORT",stop=entry_px,comment=id)
+
+// === [US-TI-44] Close immediately when SL is hit (arrays own the truth)
+maybe_close_on_stop_hit() =>
+    bool hit = array.get(pos_hitSL_arr,0)
+    if hit
+        string id = array.get(pos_entry_id_arr,0)
+        if exec_strategy
+            if is_long_pos()
+                strategy.close("LONG",comment=id)
+            if is_short_pos()
+                strategy.close("SHORT",comment=id)
+        clear_position_context()
+        delete_pos_boxes()
+
+// === VISUAL DRAW HELPERS ===
+// TI-3: Color updates — dark green TP, purple SL
+dark_green = color.rgb(0,100,0) // TI-3
+purple_col = color.rgb(128,0,128) // TI-3
+
+draw_or_update_box(is_tp,left_t,right_t,top,bottom,color_box,alpha_tp,alpha_sl) =>
+    if is_tp
+        box bx_tp = array.get(tp_box_arr,0)
+        if na(bx_tp)
+            bx_tp := box.new(left_t,top,right_t,bottom,xloc=xloc.bar_time,extend=extend.none,bgcolor=color.new(color_box,60),border_color=color.new(color_box,0))
+            array.set(tp_box_arr,0,bx_tp)
+        else
+            box.set_left(bx_tp,left_t)
+            box.set_right(bx_tp,right_t)
+            box.set_top(bx_tp,top)
+            box.set_bottom(bx_tp,bottom)
+    else
+        box bx_sl = array.get(sl_box_arr,0)
+        if na(bx_sl)
+            bx_sl := box.new(left_t,top,right_t,bottom,xloc=xloc.bar_time,extend=extend.none,bgcolor=color.new(color_box,60),border_color=color.new(color_box,0))
+            array.set(sl_box_arr,0,bx_sl)
+        else
+            box.set_left(bx_sl,left_t)
+            box.set_right(bx_sl,right_t)
+            box.set_top(bx_sl,top)
+            box.set_bottom(bx_sl,bottom)
+
+draw_or_update_entry_line(left_t,right_t,price) =>
+    line ln = array.get(entry_line_ar,0)
+    if na(ln)
+        ln := line.new(left_t,price,right_t,price,xloc=xloc.bar_time,extend=extend.none,color=color.new(color.white,0),width=1)
+        array.set(entry_line_ar,0,ln)
+    else
+        line.set_x1(ln,left_t)
+        line.set_x2(ln,right_t)
+        line.set_y1(ln,price)
+        line.set_y2(ln,price)
+    label lb = array.get(entry_lbl_arr,0)
+    string txt = "Entry: "+str.tostring(price,format.mintick)
+    if na(lb)
+        lb := label.new(right_t,price,txt,xloc=xloc.bar_time,style=label.style_label_left,textcolor=color.white,color=color.new(color.gray,70),size=size.tiny)
+        array.set(entry_lbl_arr,0,lb)
+    else
+        label.set_x(lb,right_t)
+        label.set_y(lb,price)
+        label.set_text(lb,txt)
+
+// === [US-TI-44] Visuals — use new colors; green box follows price after TP; robust even with SL=BE
+update_position_visuals() =>
+    bool can_draw = show_entries and (array.get(pos_entry_id_arr,0) != "") and not is_flat_pos()
+    if can_draw
+        float entry_px = array.get(pos_entry_px_arr,0)
+        float stop_px = array.get(pos_stop_px_arr,0)
+        float z_top = array.get(pos_zone_top_arr,0)
+        float z_bot = array.get(pos_zone_bottom_arr,0)
+        int left_t = array.get(pos_entry_time_arr,0)
+        int bar_step = na(time[1]) ? 0 : (time - time[1])
+        int right_t = time + bar_step
+        bool long_side = is_long_pos()
+        float zone_h = not na(z_top) and not na(z_bot) ? z_top - z_bot : na
+        float initial_sl = not na(zone_h) and not na(entry_px) ? (long_side ? z_bot - zone_h * sl_zone_pct : z_top + zone_h * sl_zone_pct) : na
+        float risk_initial = not na(initial_sl) and not na(entry_px) ? math.abs(entry_px - initial_sl) : na
+        if not na(entry_px) and not na(stop_px) and not na(left_t)
+            bool reached = false
+            float tp_px_static = entry_px
+            if not na(risk_initial) and risk_initial > 0
+                tp_px_static := long_side ? entry_px + target_rr * risk_initial : entry_px - target_rr * risk_initial
+                reached := long_side ? high >= tp_px_static : low <= tp_px_static
+            if reached
+                array.set(pos_hitTarget_arr,0,true)
+            if long_side
+                float tp_ref = array.get(pos_hitTarget_arr,0) ? close : tp_px_static
+                float g_top = math.max(entry_px,tp_ref)
+                float g_bot = math.min(entry_px,tp_ref)
+                draw_or_update_box(true,left_t,right_t,g_top,g_bot,dark_green,60,70) // TI-3
+                float r_top = math.max(entry_px,stop_px)
+                float r_bot = math.min(entry_px,stop_px)
+                draw_or_update_box(false,left_t,right_t,r_top,r_bot,purple_col,60,70) // TI-3
+                draw_or_update_entry_line(left_t,right_t,entry_px)
+            else
+                float tp_ref_s = array.get(pos_hitTarget_arr,0) ? close : tp_px_static
+                float g_top_s = math.max(entry_px,tp_ref_s)
+                float g_bot_s = math.min(entry_px,tp_ref_s)
+                draw_or_update_box(true,left_t,right_t,g_top_s,g_bot_s,dark_green,60,70) // TI-3
+                float r_top_s = math.max(entry_px,stop_px)
+                float r_bot_s = math.min(entry_px,stop_px)
+                draw_or_update_box(false,left_t,right_t,r_top_s,r_bot_s,purple_col,60,70) // TI-3
+                draw_or_update_entry_line(left_t,right_t,entry_px)
+    else
+        delete_pos_boxes()
+
+// ============================================================================
+// === Compact trade id "YYMMDD.ZZZZ"
+zero2(n) => n < 10 ? "0"+str.tostring(n) : str.tostring(n)
+zero4(n) => n < 10 ? "000"+str.tostring(n) : n < 100 ? "00"+str.tostring(n) : n < 1000 ? "0"+str.tostring(n) : str.tostring(n)
+var order_no_arr = array.new_int()
+if barstate.isfirst
+    array.push(order_no_arr,0)
+next_order_no() =>
+    int cur = array.get(order_no_arr,0)
+    int nxt = cur + 1
+    array.set(order_no_arr,0,nxt)
+    nxt
+make_trade_id() =>
+    int yy = year % 100
+    zero2(yy)+zero2(month)+zero2(dayofmonth)+"."+zero4(next_order_no())
+
+// TI-36: Position in the direction of trend VERSION4 — helper: map current TF to next higher TF
+next_higher_timeframe(tf) =>
+    tf == "1" ? "60" : tf == "5" ? "60" : tf == "15" ? "240" : tf == "60" ? "240" : tf == "240" ? "D" : tf == "D" ? "W" : "" // [TI-36] D→W
+
+// === TI-36: Position in the direction of trend VERSION4 — gating now uses the unified indicator booleans
+should_block_by_next_htf(sig) => // [TI-39]
+    if not follow_strong_trend
+        false
+    else
+        string cur = timeframe.period
+        string nxt = next_higher_timeframe(cur)
+        bool up_live = nxt == "60" ? h1_up_live : nxt == "240" ? h4_up_live : nxt == "D" ? d1_up_live : nxt == "W" ? w_up_live : na // [TI-39]
+        bool block_long = not na(up_live) and (not up_live) and sig == "B"
+        bool block_short = not na(up_live) and up_live and sig == "S"
+        block_long or block_short
+
+// === TI-3: STRICT B/S helpers (ONLY when extremes meet zone rules)
+is_green_candle() => close > open // TI-3
+is_red_candle() => close < open // TI-3
+value_inside_zone(val,top,bottom) => val <= top and val >= bottom // TI-3
+b_condition_strict(z_top,z_bottom) => is_green_candle() and value_inside_zone(low,z_top,z_bottom) and high > z_top // TI-3
+s_condition_strict(z_top,z_bottom) => is_red_candle() and value_inside_zone(high,z_top,z_bottom) and low < z_bottom // TI-3
+
+// === Unified label+alert+entry handler (B/S -> entry unless same direction)
+handle_signal_and_entry(sig,y,tf_lbl,zone_top,zone_bottom,zone_type) =>
+    // TI-36: gating via unified trend indicator (H1/H4/D1/W) — single source of truth
+    bool blocked = should_block_by_next_htf(sig) // [TI-39]
+
+    // [TI-36] Enforce CT-direction-only rule (LONG only if CT up/green, SHORT only if CT down/red) when enabled
+    bool blocked_ct = take_only_ct_trend ? ((sig == "B" and not ct_up_trend) or (sig == "S" and ct_up_trend)) : false // [TI-36]
+
+    // TI-3: Proximity gate to EMA20 (if enabled)
+    bool prox_ok = is_within_ema_proximity(sig) // TI-3
+
+    // TI-3: Additional S constraints when EMA_FAST < EMA_SLOW
+    bool s_gate_ok = sig == "S" ? (ema_fast_ct < ema_slow_ct ? supply_short_gate(zone_top,zone_bottom) : true) : true // TI-3
+
+    // TI-3: New gates — Major EMA proximity + H1/H4 alignment (active only when ema_proximity_atr > 0), both rely on unified trend
+    bool ema_major_gate_ok = ema_proximity_atr > 0 ? is_near_any_major_ema() : true // TI-3
+    bool htf_align_ok = ema_proximity_atr > 0 ? htf_trend_alignment_ok(sig) : true // [TI-39]
+
+    if not blocked and not blocked_ct and prox_ok and s_gate_ok and ema_major_gate_ok and htf_align_ok // TI-3 + [TI-36] combined gating
+        if show_entries
+            color c = sig == "B" ? color.new(color.green,0) : color.new(color.red,0)
+            label_style = sig == "B" ? label.style_label_up : label.style_label_down
+            label.new(bar_index,y,sig,color=c,textcolor=color.white,style=label_style,size=size.tiny)
+            // The backend speaks version-1 JSON and nothing else. The previous payload was
+            // "B MNQ1! CT vol=5809", which it answers with "unparseable", so every signal
+            // this script has ever fired was discarded on arrival. Entry, stop and target
+            // are computed here exactly as the entry block below computes them, so the
+            // message describes the trade the strategy actually takes.
+            float _zh   = zone_top - zone_bottom
+            float _sl   = sig == "B" ? zone_bottom - _zh * sl_zone_pct : zone_top + _zh * sl_zone_pct
+            float _risk = math.abs(close - _sl)
+            float _tp   = sig == "B" ? close + target_rr * _risk : close - target_rr * _risk
+            // Only emit a signal whose geometry the backend will accept. A stop on the
+            // profitable side of entry is not a trade; sending it would log a rejection.
+            bool _geom  = _risk > 0 and (sig == "B" ? _sl < close : _sl > close)
+            if _geom
+                alert('{"v":1,"secret":"' + webhook_secret + '"' +
+                  ',"strategy":"nested-zones-v1","variant":"sdzones"' +
+                  ',"id":"SD-' + syminfo.ticker + '-' + str.tostring(time) + '"' +
+                  ',"symbol":"' + syminfo.ticker + '"' +
+                  ',"side":"' + (sig == "B" ? "LONG" : "SHORT") + '"' +
+                  ',"entry":' + str.tostring(math.round_to_mintick(close)) +
+                  ',"stop":' + str.tostring(math.round_to_mintick(_sl)) +
+                  ',"target":' + str.tostring(math.round_to_mintick(_tp)) +
+                  ',"atr":' + str.tostring(math.round_to_mintick(atr_ct)) +
+                  ',"rr":' + str.tostring(target_rr) +
+                  ',"zone_top":' + str.tostring(math.round_to_mintick(zone_top)) +
+                  ',"zone_bottom":' + str.tostring(math.round_to_mintick(zone_bottom)) +
+                  ',"zone_tf":"' + tf_lbl + ' sdzones","nested":false' +
+                  ',"bar_time":' + str.tostring(time) + '}', alert.freq_once_per_bar_close)
+
+        if sig == "B"
+            bool already_long = is_long_pos()
+            if not already_long
+                bool allow_long = false
+                if is_flat_pos()
+                    allow_long := true
+                else if is_short_pos()
+                    bool gate_ok = array.get(pos_hitTarget_arr,0) or array.get(pos_hitSL_arr,0)
+                    allow_long := gate_ok
+                // [US-TI-43] Gate by ATR×mult
+                if allow_long
+                    float zone_h = zone_top - zone_bottom
+                    float sl_long = zone_bottom - zone_h * sl_zone_pct
+                    float risk_long = math.abs(close - sl_long)
+                    bool risk_ok_long = risk_long <= atr_ct * max_position_atr_mult
+                    if risk_ok_long
+                        if exec_strategy and is_short_pos()
+                            string exit_idS = array.get(pos_entry_id_arr,0)
+                            if exit_idS != ""
+                                strategy.close("SHORT",comment=exit_idS)
+                        clear_position_context()
+                        delete_pos_boxes()
+                        string new_id = make_trade_id()
+                        set_position_context(tf_lbl,zone_type,zone_top,zone_bottom,new_id)
+                        array.set(pos_side_arr,0,"LONG")
+                        array.set(pos_stop_px_arr,0,sl_long)
+                        if exec_strategy
+                            strategy.entry("LONG",strategy.long,comment=new_id)
+                            strategy.exit("LONG-SL",from_entry="LONG",stop=sl_long,comment=new_id)
+
+        if sig == "S"
+            bool already_short = is_short_pos()
+            if not already_short
+                bool allow_short = false
+                if is_flat_pos()
+                    allow_short := true
+                else if is_long_pos()
+                    bool gate_ok = array.get(pos_hitTarget_arr,0) or array.get(pos_hitSL_arr,0)
+                    allow_short := gate_ok
+                // [US-TI-43] Gate by ATR×mult
+                if allow_short
+                    float zone_h = zone_top - zone_bottom
+                    float sl_short = zone_top + zone_h * sl_zone_pct
+                    float risk_short = math.abs(close - sl_short)
+                    bool risk_ok_short = risk_short <= atr_ct * max_position_atr_mult
+                    if risk_ok_short
+                        if exec_strategy and is_long_pos()
+                            string exit_idL = array.get(pos_entry_id_arr,0)
+                            if exit_idL != ""
+                                strategy.close("LONG",comment=exit_idL)
+                        clear_position_context()
+                        delete_pos_boxes()
+                        string new_idS = make_trade_id()
+                        set_position_context(tf_lbl,zone_type,zone_top,zone_bottom,new_idS)
+                        array.set(pos_side_arr,0,"SHORT")
+                        array.set(pos_stop_px_arr,0,sl_short)
+                        if exec_strategy
+                            strategy.entry("SHORT",strategy.short,comment=new_idS)
+                            strategy.exit("SHORT-SL",from_entry="SHORT",stop=sl_short,comment=new_idS)
+
+// === [US-BUGFIX] Close on opposite signal only if Target is CONFIRMED on chart now
+maybe_close_on_signal(sig,tf_lbl) =>
+    string ctx_tf = array.get(pos_tf_label_arr,0)
+    string ctx_id = array.get(pos_entry_id_arr,0)
+    if ctx_tf != "" and ctx_id != "" and tf_lbl == ctx_tf
+        bool long_ctx = is_long_pos()
+        bool short_ctx = is_short_pos()
+        bool is_opposite = (long_ctx and sig == "S") or (short_ctx and sig == "B")
+        if is_opposite
+            bool target_flag = array.get(pos_hitTarget_arr,0)
+            float entry_px = array.get(pos_entry_px_arr,0)
+            float z_top = array.get(pos_zone_top_arr,0)
+            float z_bot = array.get(pos_zone_bottom_arr,0)
+            bool target_reached_now = false
+            if target_flag and not na(entry_px) and not na(z_top) and not na(z_bot)
+                float zone_h = z_top - z_bot
+                float initial_sl = long_ctx ? z_bot - zone_h * sl_zone_pct : z_top + zone_h * sl_zone_pct
+                float risk_initial = math.abs(entry_px - initial_sl)
+                if risk_initial > 0
+                    float tp_px = long_ctx ? entry_px + target_rr * risk_initial : entry_px - target_rr * risk_initial
+                    target_reached_now := long_ctx ? high >= tp_px : low <= tp_px
+            if target_flag and target_reached_now
+                if exec_strategy
+                    if long_ctx
+                        strategy.close("LONG",comment=ctx_id)
+                    if short_ctx
+                        strategy.close("SHORT",comment=ctx_id)
+                clear_position_context()
+                delete_pos_boxes()
+
+// === Universal MTF Pattern Detection ===
+detect_mtf_patterns_universal(tf,tf_label,open_hist,high_hist,low_hist,close_hist,atr_hist,time_hist) =>
+    string actual_tf = tf == "" ? timeframe.period : tf
+    [mtf_open,mtf_high,mtf_low,mtf_close,mtf_atr,htf_time] = request.security(syminfo.tickerid,actual_tf,[open,high,low,close,ta.atr(atr_length),time],lookahead=barmerge.lookahead_off)
+    bool is_new_htf_bar = ta.change(time(actual_tf))
+    if is_new_htf_bar and not na(mtf_open)
+        array.unshift(open_hist,mtf_open)
+        array.unshift(high_hist,mtf_high)
+        array.unshift(low_hist,mtf_low)
+        array.unshift(close_hist,mtf_close)
+        array.unshift(atr_hist,mtf_atr)
+        array.unshift(time_hist,htf_time)
+        if array.size(open_hist) > HISTORY_LENGTH
+            array.pop(open_hist)
+            array.pop(high_hist)
+            array.pop(low_hist)
+            array.pop(close_hist)
+            array.pop(atr_hist)
+            array.pop(time_hist)
+    if array.size(open_hist) >= max_small_candles + 2
+        float cur_open = safe_get_float(open_hist,0,"open_hist@cur")
+        float cur_close = safe_get_float(close_hist,0,"open_hist@cur2")
+        float cur_atr = safe_get_float(atr_hist,0,"atr_hist@cur")
+        if not na(cur_open) and not na(cur_close) and not na(cur_atr)
+            float cur_body = body_size_mtf(cur_open,cur_close)
+            float min_long_body = cur_atr * long_atr_filter
+            if cur_body >= min_long_body
+                string cur_color = is_green_mtf(cur_open,cur_close) ? "green" : is_red_mtf(cur_open,cur_close) ? "red" : "na"
+                int small_count = 0
+                int idx = 1
+                bool valid_pattern = false
+                int leg_in_index = -1
+                while idx <= max_small_candles and idx < array.size(open_hist)
+                    float s_open = safe_get_float(open_hist,idx,"open_hist@loop")
+                    float s_close = safe_get_float(close_hist,idx,"open_hist@loop")
+                    if na(s_open) or na(s_close)
+                        break
+                    float s_body = body_size_mtf(s_open,s_close)
+                    if small_count >= 1
+                        float leg_open = safe_get_float(open_hist,idx,"open_hist@legchk")
+                        float leg_close = safe_get_float(close_hist,idx,"open_hist@legchk")
+                        if na(leg_open) or na(leg_close)
+                            break
+                        float leg_body = body_size_mtf(leg_open,leg_close)
+                        if leg_body >= cur_body * leg_out_leg_in_ratio
+                            valid_pattern := true
+                            leg_in_index := idx
+                            break
+                    float s_high = safe_get_float(high_hist,idx,"high_hist@loop")
+                    float s_low = safe_get_float(low_hist,idx,"high_hist@loop")
+                    if na(s_high) or na(s_low)
+                        break
+                    float up_w = s_high - math.max(s_open,s_close)
+                    float dn_w = math.min(s_open,s_close) - s_low
+                    float mx_w = math.max(up_w,dn_w)
+                    bool wick_ok = (s_body > 0) and (mx_w <= s_body * max_wick_ratio)
+                    bool size_ok = (s_body <= cur_body * max_long_short_ratio)
+                    if wick_ok and size_ok
+                        small_count += 1
+                        idx += 1
+                    else
+                        break
+                if not valid_pattern and small_count >= 1
+                    int idx_candidate = math.min(idx,array.size(open_hist) - 1)
+                    valid_pattern := true
+                    leg_in_index := idx_candidate
+                if valid_pattern and leg_in_index > 0
+                    float leg_open = safe_get_float(open_hist,leg_in_index,"open_hist@legin")
+                    float leg_close = safe_get_float(close_hist,leg_in_index,"open_hist@legin2")
+                    if not na(leg_open) and not na(leg_close)
+                        string leg_color = is_green_mtf(leg_open,leg_close) ? "green" : is_red_mtf(leg_open,leg_close) ? "red" : "na"
+                        string zone_type = na, string zone_title = na
+                        if cur_color == "green" and leg_color == "red"
+                            zone_type := "Demand", zone_title := "drop-base-rally"
+                        else if cur_color == "green" and leg_color == "green"
+                            zone_type := "Demand", zone_title := "rally-base-rally"
+                        else if cur_color == "red" and leg_color == "green"
+                            zone_type := "Supply", zone_title := "rally-base-drop"
+                        else if cur_color == "red" and leg_color == "red"
+                            zone_type := "Supply", zone_title := "drop-base-drop"
+                        if not na(zone_type)
+                            [zone_top,zone_bottom] = find_zone_boundaries_universal(0,small_count,zone_type,open_hist,high_hist,low_hist,close_hist)
+                            color zone_color = zone_type == "Demand" ? color.green : color.red
+                            string display_tf_label = actual_tf == timeframe.period ? "CT" : tf_label
+                            int left_time = safe_get_int(time_hist,small_count,"time_hist@left_time")
+                            int legout_time0 = safe_get_int(time_hist,0,"time_hist@legout_time")
+                            string label_txt = display_tf_label+":"+zone_title+" ("+str.tostring(small_count)+")"
+                            bool draw_now = is_zone_in_range(zone_top,zone_bottom)
+                            box bx = na
+                            if draw_now
+                                bx := box.new(left_time,zone_top,left_time,zone_bottom,xloc=xloc.bar_time,extend=extend.right,border_color=zone_color,bgcolor=color.new(zone_color,85),text=label_txt,text_color=zone_color,text_size=size.small)
+                            ZoneData new_zone = ZoneData.new(bx,zone_top,zone_bottom,zone_type,left_time,display_tf_label,label_txt,small_count,legout_time0)
+                            array.unshift(active_zones,new_zone)
+                            if array.size(active_zones) > max_zones
+                                ZoneData oldest = array.pop(active_zones)
+                                if not na(oldest.zone_box)
+                                    box.delete(oldest.zone_box)
+                            ti2_cull_overlaps_same_tf()
+                            update_profit_milestones()
+                            // TI-3: Gate immediate zone-formation signals by STRICT extreme rules (ONLY when conditions are met)
+                            // [TI-50] If 'enter_only_on_retest' is ON, SUPPRESS immediate B/S signals on formation
+                            if not enter_only_on_retest // [TI-50]
+                                if zone_type == "Demand"
+                                    bool condB = b_condition_strict(zone_top,zone_bottom) // TI-3
+                                    if condB and rsi_gate_ok("B") // [TI-35]
+                                        handle_signal_and_entry("B",low,display_tf_label,zone_top,zone_bottom,zone_type)
+                                        maybe_close_on_signal("B",display_tf_label)
+                                if zone_type == "Supply"
+                                    bool condS = s_condition_strict(zone_top,zone_bottom) // TI-3
+                                    if condS and rsi_gate_ok("S") // [TI-35]
+                                        handle_signal_and_entry("S",high,display_tf_label,zone_top,zone_bottom,zone_type)
+                                        maybe_close_on_signal("S",display_tf_label)
+
+// === TI-7: Rejection detection ===
+// TI-3: STRICT rules applied — ONLY set B/S when extremes meet inside/outside conditions
+within_zone(val,top,bottom) => val <= top and val >= bottom
+detect_rejections() =>
+    if array.size(active_zones) > 0
+        float min_reject_body = atr_ct * rejection_atr_mult
+        float body = math.abs(close - open)
+        float candle_range = high - low
+        float min_reject_range = atr_ct * rejection_atr_mult
+        bool green = close > open
+        bool red = close < open
+        for i = 0 to array.size(active_zones) - 1
+            ZoneData z = safe_get_zone(active_zones,i,"active_zones@rejections")
+            if na(z)
+                continue
+            bool after_legout = time > z.legout_time
+            if not after_legout
+                continue
+            if z.zone_type == "Demand"
+                // TI-3: B ONLY when green candle low is inside demand zone AND high is outside (above) the zone
+                bool cond_b = b_condition_strict(z.top,z.bottom) // TI-3
+                if cond_b and rsi_gate_ok("B") // [TI-35]
+                    update_profit_milestones()
+                    handle_signal_and_entry("B",low,z.tf_label,z.top,z.bottom,z.zone_type)
+                    maybe_close_on_signal("B",z.tf_label)
+            if z.zone_type == "Supply"
+                // TI-3: S ONLY when red candle high is inside supply zone AND low is outside (below) the zone
+                bool cond_s = s_condition_strict(z.top,z.bottom) // TI-3
+                if cond_s and rsi_gate_ok("S") // [TI-35]
+                    update_profit_milestones()
+                    handle_signal_and_entry("S",high,z.tf_label,z.top,z.bottom,z.zone_type)
+                    maybe_close_on_signal("S",z.tf_label)
+
+// === Legacy exit manager disabled by TI-40
+manage_exits_same_tf() => 0
+
+// === Trend squares ===
+var table trend_tbl = table.new(position.bottom_right,5,1)
+trend_color(is_up) => is_up ? color.new(color.green,0) : color.new(color.red,0)
+
+// TI-3: Fix table.cell named-arg typo (text_valign=...) and use unified trend booleans
+update_trend_table() =>
+    bool ct_up = ct_up_trend // [TI-39]
+    bool h1_up = h1_up_live // [TI-39]
+    bool h4_up = h4_up_live // [TI-39]
+    bool d1_up = d1_up_live // [TI-39]
+    bool w_up  = w_up_live  // [TI-39]
+    table.cell(trend_tbl,0,0,"CT",text_color=color.white,text_halign=text.align_center,text_valign=text.align_center,bgcolor=ct_up ? color.new(color.green,0) : color.new(color.red,0),text_size=size.huge)
+    table.cell(trend_tbl,1,0,"H1",text_color=color.white,text_halign=text.align_center,text_valign=text.align_center,bgcolor=h1_up ? color.new(color.green,0) : color.new(color.red,0),text_size=size.huge)
+    table.cell(trend_tbl,2,0,"H4",text_color=color.white,text_halign=text.align_center,text_valign=text.align_center,bgcolor=h4_up ? color.new(color.green,0) : color.new(color.red,0),text_size=size.huge)
+    table.cell(trend_tbl,3,0,"D1",text_color=color.white,text_halign=text.align_center,text_valign=text.align_center,bgcolor=d1_up ? color.new(color.green,0) : color.new(color.red,0),text_size=size.huge)
+    table.cell(trend_tbl,4,0,"W", text_color=color.white,text_halign=text.align_center,text_valign=text.align_center,bgcolor=w_up ? color.new(color.green,0) : color.new(color.red,0),text_size=size.huge) // [TI-36] D→W
+
+// === Optional broker sync — now a NO-OP (arrays are the only truth)
+sync_context_with_live_position() => 0
+
+// === Main ===
+main() =>
+    update_stop_hit_flag()
+    maybe_close_on_stop_hit()
+    update_profit_milestones()
+    update_break_even_stop()
+    if show_60
+        detect_mtf_patterns_universal("60","60M",mtf_open_history_60,mtf_high_history_60,mtf_low_history_60,mtf_close_history_60,mtf_atr_history_60,mtf_time_history_60)
+    if show_15
+        detect_mtf_patterns_universal("15","15M",mtf_open_history_15,mtf_high_history_15,mtf_low_history_15,mtf_close_history_15,mtf_atr_history_15,mtf_time_history_15)
+    if show_5
+        detect_mtf_patterns_universal("5","5M",mtf_open_history_5,mtf_high_history_5,mtf_low_history_5,mtf_close_history_5,mtf_atr_history_5,mtf_time_history_5)
+    if show_ct
+        detect_mtf_patterns_universal("","CT",mtf_open_history_ct,mtf_high_history_ct,mtf_low_history_ct,mtf_close_history_ct,mtf_atr_history_ct,mtf_time_history_ct)
+    update_zones()
+    detect_rejections()
+    if exec_strategy
+        manage_exits_same_tf()
+    sync_context_with_live_position() // no-op by design
+    update_position_visuals()
+    update_trend_table()
+
+// Run main
+main()

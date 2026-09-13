@@ -285,6 +285,14 @@ rejects(bool long) =>
     bool brk  = long ? close > high[1] : close < low[1]
     wick or eng or brk
 
+// Declared LAST on purpose. Pine numbers inputs by declaration order, so adding one
+// anywhere above would silently renumber every saved input on the chart.
+grpW = "Webhook"
+sendAlerts    = input.bool(true, "Emit JSON alerts", group=grpW)
+webhookSecret = input.string("", "Webhook secret", group=grpW)
+
+var string sigId = na
+
 rsiv  = ta.rsi(close, rsiLen)
 atrCt = ta.atr(atrLen)
 
@@ -323,4 +331,35 @@ if barstate.isconfirmed and strategy.position_size == 0 and not na(atrCt) and ar
                     box.new(z.born, z.top, bar_index, z.bot,
                          border_color = z.dem ? #089981 : #f23645,
                          bgcolor = z.dem ? color.new(#089981, 80) : color.new(#f23645, 80))
+                // OPEN. The id is deterministic from symbol + bar time + side, so a
+                // duplicate delivery is rejected by the backend rather than doubled.
+                if sendAlerts
+                    sigId := syminfo.ticker + "-" + str.tostring(time) + "-" + (z.dem ? "L" : "S")
+                    alert('{"v":1,"secret":"' + webhookSecret + '"' +
+                         ',"strategy":"continuation-b-v2"' +
+                         ',"event":"OPEN"' +
+                         ',"id":"' + sigId + '"' +
+                         ',"symbol":"' + syminfo.ticker + '"' +
+                         ',"side":"' + (z.dem ? "LONG" : "SHORT") + '"' +
+                         ',"entry":' + str.tostring(e, "#.#####") +
+                         ',"stop":' + str.tostring(sl, "#.#####") +
+                         ',"target":' + str.tostring(tp, "#.#####") +
+                         ',"atr":' + str.tostring(atrCt, "#.#####") +
+                         ',"bar_time":' + str.tostring(time_close) + '}', alert.freq_once_per_bar_close)
             break
+
+
+// ─────────── CLOSE ───────────
+// strategy.closedtrades rises on the bar the bracket fills. Report the realised P&L so
+// the backend can close its risk registry entry and advance equity.
+if sendAlerts and ta.change(strategy.closedtrades) > 0 and not na(sigId)
+    float pnl = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    float exitPx = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
+    alert('{"v":1,"secret":"' + webhookSecret + '"' +
+         ',"strategy":"continuation-b-v2"' +
+         ',"event":"CLOSE"' +
+         ',"signalId":"' + sigId + '"' +
+         ',"symbol":"' + syminfo.ticker + '"' +
+         ',"exit":' + str.tostring(exitPx, "#.#####") +
+         ',"pnl":' + str.tostring(pnl, "#.##") +
+         ',"bar_time":' + str.tostring(time_close) + '}', alert.freq_once_per_bar_close)

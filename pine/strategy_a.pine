@@ -1,0 +1,276 @@
+//@version=5
+// STRATEGY A - REVERSAL
+//
+// Fade the move arriving at a zone. Identical zone construction and identical 3-of-4
+// confluence filter as Strategy B. No trend filter - direction comes from the zone.
+//
+// Sequence, all on the 15m chart:
+//   arrival   price trades into the zone
+//   divergence RSI disagrees with price on the last two confirmed pivots within 40 bars
+//   rejection within 20 bars, a close 1.5 x ATR beyond the proximal edge, zone direction
+//   retest    within 12 bars, price returns to the proximal edge and closes back on side
+//   enter at that close, stop 30% of zone width beyond distal, target fixed 3R
+strategy("Strategy A - Reversal", overlay=true,
+     max_boxes_count=500, max_labels_count=500, max_lines_count=100,
+     initial_capital=10000, default_qty_type=strategy.fixed, default_qty_value=1,
+     pyramiding=0, commission_type=strategy.commission.cash_per_order, commission_value=0.5,
+     slippage=1, calc_on_every_tick=false)
+
+grpZ = "Zone construction"
+atrLen    = input.int(14,   "ATR length", group=grpZ)
+legAtr    = input.float(1.0,"Leg-out body >= x ATR", step=0.1, group=grpZ)
+baseMax   = input.int(3,    "Max base candles", group=grpZ)
+baseRatio = input.float(0.5,"Base body <= x next body", step=0.05, group=grpZ)
+swingLR   = input.int(2,    "Swing pivot left/right", group=grpZ)
+maxZones  = input.int(200,  "Max live zones per timeframe", group=grpZ)
+
+grpC = "Confluence"
+needTF    = input.int(3, "Timeframes that must agree (of 4)", minval=1, maxval=4, group=grpC)
+tfA       = input.timeframe("5",   "Zone TF 1", group=grpC)
+tfC       = input.timeframe("60",  "Zone TF 3", group=grpC)
+tfD       = input.timeframe("240", "Zone TF 4", group=grpC)
+
+grpS = "Sequence"
+rsiLen    = input.int(14, "RSI length", group=grpS)
+divLook   = input.int(40, "Divergence pivots within x bars", group=grpS)
+rejAtr    = input.float(1.5, "Rejection close = x ATR beyond proximal", step=0.1, group=grpS)
+rejWin    = input.int(20, "Rejection within x bars of arrival", group=grpS)
+retWin    = input.int(12, "Retest within x bars of rejection", group=grpS)
+
+grpE = "Execution"
+slPct     = input.float(0.30, "Stop = x zone width beyond distal", step=0.05, group=grpE)
+targetR   = input.float(3.0,  "Target (R)", step=0.5, group=grpE)
+noRoll    = input.bool(true,  "Skip contract-roll days", group=grpE)
+drawZones = input.bool(true,  "Draw traded zones", group=grpE)
+
+// ─────────── zone ───────────
+// stage 0 waiting for arrival, 1 arrived with divergence, 2 rejected, 3 finished
+type Zone
+    float top
+    float bot
+    bool  dem
+    int   born
+    int   stage
+    int   tArr
+    int   tRej
+
+var array<Zone> zA = array.new<Zone>()
+var array<Zone> zB = array.new<Zone>()
+var array<Zone> zC = array.new<Zone>()
+var array<Zone> zD = array.new<Zone>()
+
+bodyOf(float o, float c) => math.abs(c - o)
+
+detect() =>
+    float a  = ta.atr(atrLen)
+    float ph = ta.pivothigh(high, swingLR, swingLR)
+    float pl = ta.pivotlow(low, swingLR, swingLR)
+    var float lastPH = na
+    var float lastPL = na
+    if not na(ph)
+        lastPH := ph
+    if not na(pl)
+        lastPL := pl
+
+    float lo   = bodyOf(open, close)
+    bool  bull = close > open
+    float zt = na
+    float zb = na
+    bool  dem = false
+    bool  ok  = false
+
+    if not na(a) and a > 0 and lo >= legAtr * a and close != open
+        int n = 0
+        float nextBody = lo
+        while n < baseMax and bodyOf(open[1 + n], close[1 + n]) <= nextBody * baseRatio
+            nextBody := bodyOf(open[1 + n], close[1 + n])
+            n += 1
+        if n >= 1
+            bool bos = bull ? (not na(lastPH) and close > lastPH) : (not na(lastPL) and close < lastPL)
+            bool fvg = bull ? (high[2] < low) : (low[2] > high)
+            if bos and fvg
+                float t = high[1]
+                float b = low[1]
+                for i = 1 to n
+                    t := math.max(t, high[i])
+                    b := math.min(b, low[i])
+                if t > b
+                    zt  := t
+                    zb  := b
+                    dem := bull
+                    ok  := true
+    [ok, zt, zb, dem]
+
+// The 5m book must see EVERY 5m bar. request.security on a lower timeframe delivers only
+// the last sub-bar of each chart bar, which silently drops two thirds of the 5m zones.
+detOk() =>
+    [o, t, b, d] = detect()
+    o ? 1.0 : 0.0
+detTop() =>
+    [o, t, b, d] = detect()
+    t
+detBot() =>
+    [o, t, b, d] = detect()
+    b
+detDem() =>
+    [o, t, b, d] = detect()
+    d ? 1.0 : 0.0
+
+aOk  = request.security_lower_tf(syminfo.tickerid, tfA, detOk())
+aTop = request.security_lower_tf(syminfo.tickerid, tfA, detTop())
+aBot = request.security_lower_tf(syminfo.tickerid, tfA, detBot())
+aDem = request.security_lower_tf(syminfo.tickerid, tfA, detDem())
+[okC, tC, bC, dC] = request.security(syminfo.tickerid, tfC, detect(), lookahead=barmerge.lookahead_off)
+[okD, tD, bD, dD] = request.security(syminfo.tickerid, tfD, detect(), lookahead=barmerge.lookahead_off)
+[okB, tB, bB, dB] = detect()
+
+newC = ta.change(time(tfC)) != 0
+newD = ta.change(time(tfD)) != 0
+
+push(array<Zone> arr, bool ok, float t, float b, bool dem) =>
+    if ok and not na(t) and not na(b)
+        bool clash = false
+        if array.size(arr) > 0
+            for i = 0 to array.size(arr) - 1
+                Zone q = array.get(arr, i)
+                if q.dem == dem and q.bot <= t and b <= q.top
+                    clash := true
+                    break
+        if not clash
+            array.unshift(arr, Zone.new(t, b, dem, bar_index, 0, 0, 0))
+            if array.size(arr) > maxZones
+                array.pop(arr)
+
+if array.size(aOk) > 0
+    for k = 0 to array.size(aOk) - 1
+        if array.get(aOk, k) > 0.5
+            push(zA, true, array.get(aTop, k), array.get(aBot, k), array.get(aDem, k) > 0.5)
+if newC
+    push(zC, okC, tC, bC, dC)
+if newD
+    push(zD, okD, tD, bD, dD)
+push(zB, okB, tB, bB, dB)
+
+killThrough(array<Zone> arr) =>
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            Zone z = array.get(arr, i)
+            if bar_index > z.born and ((z.dem and close < z.bot) or (not z.dem and close > z.top))
+                array.remove(arr, i)
+killThrough(zA)
+killThrough(zB)
+killThrough(zC)
+killThrough(zD)
+
+hasOverlap(array<Zone> arr, float t, float b, bool dem, int bornAt) =>
+    bool found = false
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            Zone q = array.get(arr, i)
+            if q.dem == dem and q.bot <= t and b <= q.top and q.born <= bornAt
+                found := true
+                break
+    found
+
+confluence(float t, float b, bool dem, int bornAt) =>
+    int c = 0
+    if hasOverlap(zA, t, b, dem, bornAt)
+        c += 1
+    if hasOverlap(zB, t, b, dem, bornAt)
+        c += 1
+    if hasOverlap(zC, t, b, dem, bornAt)
+        c += 1
+    if hasOverlap(zD, t, b, dem, bornAt)
+        c += 1
+    c
+
+// ─────────── RSI divergence on the last two confirmed chart pivots ───────────
+rsiv  = ta.rsi(close, rsiLen)
+atrCt = ta.atr(atrLen)
+
+ph15 = ta.pivothigh(high, swingLR, swingLR)
+pl15 = ta.pivotlow(low, swingLR, swingLR)
+
+var float pHi1 = na, var float pHi0 = na       // price at last / previous pivot high
+var float rHi1 = na, var float rHi0 = na       // RSI at the same pivots
+var int   tHi1 = na, var int   tHi0 = na
+var float pLo1 = na, var float pLo0 = na
+var float rLo1 = na, var float rLo0 = na
+var int   tLo1 = na, var int   tLo0 = na
+
+if not na(ph15)
+    pHi0 := pHi1
+    rHi0 := rHi1
+    tHi0 := tHi1
+    pHi1 := ph15
+    rHi1 := rsiv[swingLR]
+    tHi1 := bar_index - swingLR
+if not na(pl15)
+    pLo0 := pLo1
+    rLo0 := rLo1
+    tLo0 := tLo1
+    pLo1 := pl15
+    rLo1 := rsiv[swingLR]
+    tLo1 := bar_index - swingLR
+
+// supply: higher high in price, lower high in RSI. demand: lower low, higher low in RSI.
+bearDiv = not na(pHi0) and not na(rHi0) and pHi1 > pHi0 and rHi1 < rHi0 and (bar_index - tHi0) <= divLook
+bullDiv = not na(pLo0) and not na(rLo0) and pLo1 < pLo0 and rLo1 > rLo0 and (bar_index - tLo0) <= divLook
+
+isRollDay() =>
+    int m = month(time)
+    bool q = m == 3 or m == 6 or m == 9 or m == 12
+    q and dayofmonth(time) >= 8 and dayofmonth(time) <= 15
+
+// ─────────── sequence state machine ───────────
+canTrade = barstate.isconfirmed and not na(atrCt) and (not noRoll or not isRollDay())
+
+if canTrade and array.size(zB) > 0
+    for i = 0 to array.size(zB) - 1
+        Zone z = array.get(zB, i)
+        if z.stage == 3 or bar_index <= z.born
+            continue
+        float prox = z.dem ? z.top : z.bot
+        float dist = z.dem ? z.bot : z.top
+
+        if z.stage == 0
+            bool arrived = z.dem ? low <= prox : high >= prox
+            if arrived
+                bool div = z.dem ? bullDiv : bearDiv
+                if div
+                    z.stage := 1
+                    z.tArr  := bar_index
+                else
+                    z.stage := 3            // no divergence, discard the zone
+        else if z.stage == 1
+            if bar_index - z.tArr > rejWin
+                z.stage := 3
+            else
+                bool rej = z.dem ? close >= prox + rejAtr * atrCt : close <= prox - rejAtr * atrCt
+                if rej
+                    z.stage := 2
+                    z.tRej  := bar_index
+        else if z.stage == 2
+            if bar_index - z.tRej > retWin
+                z.stage := 3
+            else
+                bool back = z.dem ? (low <= prox and close > prox) : (high >= prox and close < prox)
+                if back
+                    z.stage := 3
+                    if strategy.position_size == 0 and confluence(z.top, z.bot, z.dem, z.born) >= needTF
+                        float w  = z.top - z.bot
+                        float sl = z.dem ? dist - w * slPct : dist + w * slPct
+                        float e  = close
+                        float r  = math.abs(e - sl)
+                        if r > 0 and (z.dem ? sl < e : sl > e)
+                            float tp = z.dem ? e + targetR * r : e - targetR * r
+                            if z.dem
+                                strategy.entry("A-L", strategy.long)
+                                strategy.exit("A-L x", "A-L", stop=sl, limit=tp)
+                            else
+                                strategy.entry("A-S", strategy.short)
+                                strategy.exit("A-S x", "A-S", stop=sl, limit=tp)
+                            if drawZones
+                                box.new(z.born, z.top, bar_index, z.bot,
+                                     border_color = z.dem ? #089981 : #f23645,
+                                     bgcolor = z.dem ? color.new(#089981, 80) : color.new(#f23645, 80))

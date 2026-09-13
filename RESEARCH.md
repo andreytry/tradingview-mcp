@@ -1,5 +1,11 @@
 # Research Notes
 
+## Guidelines
+
+Always give me fucking full breakdown of traded tickers including FX!!!
+
+
+
 ## Motivation
 
 Agent-forward trading represents an emerging paradigm where LLM agents assist — but do not replace — human traders. This project is a practical exploration of the interface layer required to make that possible.

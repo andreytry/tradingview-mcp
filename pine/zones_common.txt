@@ -1,0 +1,13 @@
+ZONE CONSTRUCTION (identical in both strategies)
+  base        up to 3 candles, each body <= 50% of the leg-out candle's body
+  leg-out     body >= 1 x ATR(14) of its own timeframe
+  BOS         leg-out closes beyond the prior swing high (demand) / swing low (supply)
+  FVG         3-bar imbalance: high[2] < low (demand) / low[2] > high (supply)
+  boundaries  zone top/bottom = high/low of the BASE candles
+  proximal    the edge price returns from; distal = the far side
+  built on    5m, 15m, 1h, 4h independently
+
+CONFLUENCE
+  >= 3 of the 4 timeframes hold an OVERLAPPING same-direction zone at the same price
+  overlap, not containment
+  the higher-timeframe zone must be confirmed BEFORE the entry-timeframe zone

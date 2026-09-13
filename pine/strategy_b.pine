@@ -12,7 +12,17 @@ strategy("Strategy B - Trend Continuation", overlay=true,
      max_boxes_count=500, max_labels_count=500, max_lines_count=100,
      initial_capital=10000, default_qty_type=strategy.fixed, default_qty_value=1,
      pyramiding=0, commission_type=strategy.commission.cash_per_order, commission_value=0.5,
-     slippage=1, calc_on_every_tick=false)
+     slippage=1, calc_on_every_tick=false,
+     // The stop and target are computed from THIS bar's close, so the fill has to happen
+     // at this bar's close too. Without this, strategy.entry is a market order that fills
+     // at the NEXT bar's open, and the risk geometry is measured from a different bar
+     // than the one actually entered.
+     process_orders_on_close=true,
+     // Explicit rather than implied. No extra intrabar recalculation after a fill.
+     calc_on_order_fills=false)
+// NOTE: use_bar_magnifier=true would resolve fills on 1-minute bars and remove the
+// stop-first assumption on a bar that spans both levels. It requires a Premium plan;
+// this account is on Essential and TradingView refuses to compute the report with it on.
 
 grpZ = "Zone construction"
 atrLen    = input.int(14,   "ATR length", group=grpZ)
@@ -45,7 +55,7 @@ drawZones = input.bool(true,  "Draw traded zones", group=grpE)
 grpR = "Relaxations"
 useFVG    = input.bool(true,  "Require 3-bar imbalance", group=grpR)
 useBOS    = input.bool(true,  "Require break of structure", group=grpR)
-trendMode = input.string("hh_hl", "Trend definition", options=["hh_hl", "htf_candle"], group=grpR)
+trendMode = input.string("hh_hl", "Trend definition", options=["hh_hl", "htf_candle", "off"], group=grpR)
 
 // ─────────── zone ───────────
 type Zone
@@ -168,7 +178,7 @@ trendStruct = request.security(syminfo.tickerid, trendTF, trendCalc(), lookahead
 htfC = request.security(syminfo.tickerid, trendTF, close[1], lookahead=barmerge.lookahead_off)
 htfO = request.security(syminfo.tickerid, trendTF, open[1],  lookahead=barmerge.lookahead_off)
 trendCandle = htfC > htfO ? 1 : htfC < htfO ? -1 : 0
-trend = trendMode == "hh_hl" ? trendStruct : trendCandle
+trend = trendMode == "hh_hl" ? trendStruct : trendMode == "htf_candle" ? trendCandle : 0
 
 // ─────────── confluence ───────────
 // overlap, not containment; the other timeframe's zone must be the older one
@@ -293,7 +303,8 @@ if barstate.isconfirmed and strategy.position_size == 0 and not na(atrCt) and ar
             continue
         z.used := true                      // consumed on first touch, entered or not
         int  tuse  = trendWhen == "touch" ? trend : z.tdir
-        bool dirOk = z.dem ? tuse == 1 : tuse == -1
+        // "off" means take the zone's own direction and impose no trend condition
+        bool dirOk = trendMode == "off" ? true : (z.dem ? tuse == 1 : tuse == -1)
         bool rsiOk = z.dem ? rsiv < rsiLongMax : rsiv > rsiShortMin
         if dirOk and rsiOk and rejects(z.dem)
             float w  = z.top - z.bot

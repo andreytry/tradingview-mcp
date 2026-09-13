@@ -43,6 +43,11 @@ targetR   = input.float(3.0,  "Target (R)", step=0.5, group=grpE)
 noRoll    = input.bool(true,  "Skip contract-roll days", group=grpE)
 drawZones = input.bool(true,  "Draw traded zones", group=grpE)
 
+grpR = "Relaxations"
+useFVG = input.bool(true, "Require 3-bar imbalance", group=grpR)
+useBOS = input.bool(true, "Require break of structure", group=grpR)
+useDiv = input.bool(true, "Require RSI divergence", group=grpR)
+
 // ─────────── zone ───────────
 // stage 0 waiting for arrival, 1 arrived with divergence, 2 rejected, 3 finished
 type Zone
@@ -86,8 +91,8 @@ detect() =>
             nextBody := bodyOf(open[1 + n], close[1 + n])
             n += 1
         if n >= 1
-            bool bos = bull ? (not na(lastPH) and close > lastPH) : (not na(lastPL) and close < lastPL)
-            bool fvg = bull ? (high[2] < low) : (low[2] > high)
+            bool bos = not useBOS or (bull ? (not na(lastPH) and close > lastPH) : (not na(lastPL) and close < lastPL))
+            bool fvg = not useFVG or (bull ? (high[2] < low) : (low[2] > high))
             if bos and fvg
                 float t = high[1]
                 float b = low[1]
@@ -236,7 +241,7 @@ if canTrade and array.size(zB) > 0
         if z.stage == 0
             bool arrived = z.dem ? low <= prox : high >= prox
             if arrived
-                bool div = z.dem ? bullDiv : bearDiv
+                bool div = not useDiv or (z.dem ? bullDiv : bearDiv)
                 if div
                     z.stage := 1
                     z.tArr  := bar_index

@@ -42,6 +42,11 @@ targetR   = input.float(2.0,  "Target (R)", step=0.5, group=grpE)
 noRoll    = input.bool(true,  "Skip contract-roll days", group=grpE)
 drawZones = input.bool(true,  "Draw traded zones", group=grpE)
 
+grpR = "Relaxations"
+useFVG    = input.bool(true,  "Require 3-bar imbalance", group=grpR)
+useBOS    = input.bool(true,  "Require break of structure", group=grpR)
+trendMode = input.string("hh_hl", "Trend definition", options=["hh_hl", "htf_candle"], group=grpR)
+
 // ─────────── zone ───────────
 type Zone
     float top
@@ -85,8 +90,8 @@ detect() =>
             nextBody := bodyOf(open[1 + n], close[1 + n])
             n += 1
         if n >= 1
-            bool bos = bull ? (not na(lastPH) and close > lastPH) : (not na(lastPL) and close < lastPL)
-            bool fvg = bull ? (high[2] < low) : (low[2] > high)
+            bool bos = not useBOS or (bull ? (not na(lastPH) and close > lastPH) : (not na(lastPL) and close < lastPL))
+            bool fvg = not useFVG or (bull ? (high[2] < low) : (low[2] > high))
             if bos and fvg
                 float t = high[1]
                 float b = low[1]
@@ -157,7 +162,11 @@ trendCalc() =>
         dir := up ? 1 : dn ? -1 : 0
     dir
 
-trend = request.security(syminfo.tickerid, trendTF, trendCalc(), lookahead=barmerge.lookahead_off)
+trendStruct = request.security(syminfo.tickerid, trendTF, trendCalc(), lookahead=barmerge.lookahead_off)
+htfC = request.security(syminfo.tickerid, trendTF, close[1], lookahead=barmerge.lookahead_off)
+htfO = request.security(syminfo.tickerid, trendTF, open[1],  lookahead=barmerge.lookahead_off)
+trendCandle = htfC > htfO ? 1 : htfC < htfO ? -1 : 0
+trend = trendMode == "hh_hl" ? trendStruct : trendCandle
 
 push(array<Zone> arr, bool ok, float t, float b, bool dem, int trendNow) =>
     if ok and not na(t) and not na(b)

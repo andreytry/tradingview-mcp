@@ -84,10 +84,11 @@ detect() =>
 
     if not na(a) and a > 0 and lo >= legAtr * a and close != open
         // base: up to baseMax candles, each body <= baseRatio x the body that follows it
+        // each base candle is measured against the LEG-OUT body, not the candle after it.
+        // Chaining it makes candle 2 need <=25% and candle 3 <=12.5%, which all but
+        // removes multi-candle bases and builds zones that are far too narrow.
         int n = 0
-        float nextBody = lo
-        while n < baseMax and bodyOf(open[1 + n], close[1 + n]) <= nextBody * baseRatio
-            nextBody := bodyOf(open[1 + n], close[1 + n])
+        while n < baseMax and bodyOf(open[1 + n], close[1 + n]) <= lo * baseRatio
             n += 1
         if n >= 1
             bool bos = not useBOS or (bull ? (not na(lastPH) and close > lastPH) : (not na(lastPL) and close < lastPL))

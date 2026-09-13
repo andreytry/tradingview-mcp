@@ -20,7 +20,7 @@ legAtr    = input.float(1.0,"Leg-out body >= x ATR", step=0.1, group=grpZ)
 baseMax   = input.int(3,    "Max base candles", group=grpZ)
 baseRatio = input.float(0.5,"Base body <= x next body", step=0.05, group=grpZ)
 swingLR   = input.int(2,    "Swing pivot left/right", group=grpZ)
-maxZones  = input.int(200,  "Max live zones per timeframe", group=grpZ)
+maxZones  = input.int(2000,  "Max live zones per timeframe", group=grpZ)
 
 grpC = "Confluence"
 needTF    = input.int(3, "Timeframes that must agree (of 4)", minval=1, maxval=4, group=grpC)
@@ -55,6 +55,7 @@ type Zone
     int   born      // bar_index of the chart bar on which the zone was registered
     bool  used
     int   tdir      // 1h trend as it stood when the zone was registered
+    int   conf      // confluence count, resolved once when the zone was registered
 
 var array<Zone> zA = array.new<Zone>()
 var array<Zone> zB = array.new<Zone>()
@@ -169,44 +170,6 @@ htfO = request.security(syminfo.tickerid, trendTF, open[1],  lookahead=barmerge.
 trendCandle = htfC > htfO ? 1 : htfC < htfO ? -1 : 0
 trend = trendMode == "hh_hl" ? trendStruct : trendCandle
 
-push(array<Zone> arr, bool ok, float t, float b, bool dem, int trendNow) =>
-    if ok and not na(t) and not na(b)
-        // keep the older of two overlapping same-direction zones on one timeframe,
-        // otherwise a slow grind stacks near-identical zones and confluence is noise
-        bool clash = false
-        if array.size(arr) > 0
-            for i = 0 to array.size(arr) - 1
-                Zone q = array.get(arr, i)
-                if q.dem == dem and q.bot <= t and b <= q.top
-                    clash := true
-                    break
-        if not clash
-            array.unshift(arr, Zone.new(t, b, dem, bar_index, false, trendNow))
-            if array.size(arr) > maxZones
-                array.pop(arr)
-
-if array.size(aOk) > 0
-    for k = 0 to array.size(aOk) - 1
-        if array.get(aOk, k) > 0.5
-            push(zA, true, array.get(aTop, k), array.get(aBot, k), array.get(aDem, k) > 0.5, trend)
-if newC
-    push(zC, okC, tC, bC, dC, trend)
-if newD
-    push(zD, okD, tD, bD, dD, trend)
-push(zB, okB, tB, bB, dB, trend)
-
-// a zone dies when price closes clean through its distal edge
-killThrough(array<Zone> arr) =>
-    if array.size(arr) > 0
-        for i = array.size(arr) - 1 to 0
-            Zone z = array.get(arr, i)
-            if bar_index > z.born and ((z.dem and close < z.bot) or (not z.dem and close > z.top))
-                array.remove(arr, i)
-killThrough(zA)
-killThrough(zB)
-killThrough(zC)
-killThrough(zD)
-
 // ─────────── confluence ───────────
 // overlap, not containment; the other timeframe's zone must be the older one
 hasOverlap(array<Zone> arr, float t, float b, bool dem, int bornAt) =>
@@ -231,6 +194,67 @@ confluence(float t, float b, bool dem, int bornAt) =>
         c += 1
     c
 
+
+// Confluence is counted ONCE, when the zone is created, against every zone ever
+// detected on the other timeframes - not against a pruned "still alive" book, and not
+// re-counted later at the touch. Both of those starve the count to almost nothing.
+confAt(float t, float b, bool dem) =>
+    int c = 1
+    if hasOverlap(zA, t, b, dem, bar_index)
+        c += 1
+    if hasOverlap(zC, t, b, dem, bar_index)
+        c += 1
+    if hasOverlap(zD, t, b, dem, bar_index)
+        c += 1
+    c
+
+push(array<Zone> arr, bool ok, float t, float b, bool dem, int trendNow) =>
+    if ok and not na(t) and not na(b)
+        // keep the older of two overlapping same-direction zones on one timeframe,
+        // otherwise a slow grind stacks near-identical zones and confluence is noise
+        bool clash = false
+        if array.size(arr) > 0
+            for i = 0 to array.size(arr) - 1
+                Zone q = array.get(arr, i)
+                if q.dem == dem and q.bot <= t and b <= q.top
+                    clash := true
+                    break
+        if not clash
+            array.unshift(arr, Zone.new(t, b, dem, bar_index, false, trendNow, 0))
+            if array.size(arr) > maxZones
+                array.pop(arr)
+
+if array.size(aOk) > 0
+    for k = 0 to array.size(aOk) - 1
+        if array.get(aOk, k) > 0.5
+            push(zA, true, array.get(aTop, k), array.get(aBot, k), array.get(aDem, k) > 0.5, trend)
+if newC
+    push(zC, okC, tC, bC, dC, trend)
+if newD
+    push(zD, okD, tD, bD, dD, trend)
+if okB and not na(tB) and not na(bB)
+    int cfB = confAt(tB, bB, dB)
+    if cfB >= needTF
+        bool clashB = false
+        if array.size(zB) > 0
+            for i = 0 to array.size(zB) - 1
+                Zone q = array.get(zB, i)
+                if q.dem == dB and q.bot <= tB and bB <= q.top
+                    clashB := true
+                    break
+        if not clashB
+            array.unshift(zB, Zone.new(tB, bB, dB, bar_index, false, trend, cfB))
+            if array.size(zB) > maxZones
+                array.pop(zB)
+
+// a zone dies when price closes clean through its distal edge
+killThrough(array<Zone> arr) =>
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            Zone z = array.get(arr, i)
+            if bar_index > z.born and ((z.dem and close < z.bot) or (not z.dem and close > z.top))
+                array.remove(arr, i)
+killThrough(zB)
 
 // ─────────── contract roll ───────────
 isRollDay() =>
@@ -271,7 +295,7 @@ if barstate.isconfirmed and strategy.position_size == 0 and not na(atrCt) and ar
         int  tuse  = trendWhen == "touch" ? trend : z.tdir
         bool dirOk = z.dem ? tuse == 1 : tuse == -1
         bool rsiOk = z.dem ? rsiv < rsiLongMax : rsiv > rsiShortMin
-        if dirOk and rsiOk and confluence(z.top, z.bot, z.dem, z.born) >= needTF and rejects(z.dem)
+        if dirOk and rsiOk and rejects(z.dem)
             float w  = z.top - z.bot
             float sl = z.dem ? dist - w * slPct : dist + w * slPct
             float e  = close

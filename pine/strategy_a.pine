@@ -229,7 +229,6 @@ killThrough(zB)
 // anywhere above would silently renumber every saved input on the chart.
 grpW = "Webhook"
 sendAlerts    = input.bool(true, "Emit JSON alerts", group=grpW)
-webhookSecret = input.string("", "Webhook secret", group=grpW)
 
 var string sigId = na
 
@@ -345,7 +344,7 @@ if canTrade and array.size(zB) > 0
                             // duplicate delivery is rejected by the backend, not doubled.
                             if sendAlerts
                                 sigId := syminfo.ticker + "-" + str.tostring(time) + "-" + (z.dem ? "L" : "S")
-                                alert('{"v":1,"secret":"' + webhookSecret + '"' +
+                                alert('{"v":1' +
                                      ',"strategy":"reversal-a-v2"' +
                                      ',"event":"OPEN"' +
                                      ',"id":"' + sigId + '"' +
@@ -364,7 +363,7 @@ if canTrade and array.size(zB) > 0
 if sendAlerts and ta.change(strategy.closedtrades) > 0 and not na(sigId)
     float pnl = strategy.closedtrades.profit(strategy.closedtrades - 1)
     float exitPx = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
-    alert('{"v":1,"secret":"' + webhookSecret + '"' +
+    alert('{"v":1' +
          ',"strategy":"reversal-a-v2"' +
          ',"event":"CLOSE"' +
          ',"signalId":"' + sigId + '"' +

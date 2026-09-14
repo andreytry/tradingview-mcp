@@ -8,7 +8,6 @@
 strategy("GTX Ping", overlay=true, process_orders_on_close=true, calc_on_every_tick=false)
 
 sendAlerts    = input.bool(true, "Emit JSON alerts")
-webhookSecret = input.string("ping", "Webhook secret")
 
 a = ta.atr(14)
 if barstate.isconfirmed and not na(a) and a > 0
@@ -17,7 +16,7 @@ if barstate.isconfirmed and not na(a) and a > 0
     float tp = e + 2 * (e - sl)
     string id = "PING-" + syminfo.ticker + "-" + str.tostring(time)
     if sendAlerts
-        alert('{"v":1,"secret":"' + webhookSecret + '"' +
+        alert('{"v":1' +
              ',"strategy":"reversal-a-v2"' +
              ',"event":"OPEN"' +
              ',"id":"' + id + '"' +

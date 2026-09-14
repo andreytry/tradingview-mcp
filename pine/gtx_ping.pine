@@ -1,0 +1,31 @@
+//@version=5
+// GTX PING - throwaway proof that a TradingView-ORIGINATED alert() reaches the backend as
+// a paper trade. Fires one valid OPEN payload on every confirmed bar close. Arm it on a
+// 1-minute chart, wait one bar, check the book, then stop the alert and delete this.
+//
+// Geometry is chosen to clear every backend gate on purpose: risk = 0.9 ATR (under the
+// 1.0 ATR cap), target = exactly 2R (reversal-a-v2 declares targetR 2, tolerance 2 ticks).
+strategy("GTX Ping", overlay=true, process_orders_on_close=true, calc_on_every_tick=false)
+
+sendAlerts    = input.bool(true, "Emit JSON alerts")
+webhookSecret = input.string("ping", "Webhook secret")
+
+a = ta.atr(14)
+if barstate.isconfirmed and not na(a) and a > 0
+    float e  = close
+    float sl = e - 0.9 * a
+    float tp = e + 2 * (e - sl)
+    string id = "PING-" + syminfo.ticker + "-" + str.tostring(time)
+    if sendAlerts
+        alert('{"v":1,"secret":"' + webhookSecret + '"' +
+             ',"strategy":"reversal-a-v2"' +
+             ',"event":"OPEN"' +
+             ',"id":"' + id + '"' +
+             ',"symbol":"' + syminfo.ticker + '"' +
+             ',"side":"LONG"' +
+             ',"entry":' + str.tostring(e, "#.#####") +
+             ',"stop":' + str.tostring(sl, "#.#####") +
+             ',"target":' + str.tostring(tp, "#.#####") +
+             ',"atr":' + str.tostring(a, "#.#####") +
+             ',"bar_time":' + str.tostring(time_close) + '}', alert.freq_once_per_bar_close)
+plot(a, "atr", display=display.data_window)

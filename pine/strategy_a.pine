@@ -28,14 +28,14 @@ strategy("Strategy A - Reversal", overlay=true,
 
 grpZ = "Zone construction"
 atrLen    = input.int(14,   "ATR length", group=grpZ)
-legAtr    = input.float(1.0,"Leg-out body >= x ATR", step=0.1, group=grpZ)
+legAtr    = input.float(0.75,"Leg-out body >= x ATR", step=0.1, group=grpZ)
 baseMax   = input.int(3,    "Max base candles", group=grpZ)
 baseRatio = input.float(0.5,"Base body <= x next body", step=0.05, group=grpZ)
 swingLR   = input.int(2,    "Swing pivot left/right", group=grpZ)
 maxZones  = input.int(2000,  "Max live zones per timeframe", group=grpZ)
 
 grpC = "Confluence"
-needTF    = input.int(3, "Timeframes that must agree (of 4)", minval=1, maxval=4, group=grpC)
+needTF    = input.int(2, "Timeframes that must agree (of 4)", minval=1, maxval=4, group=grpC)
 tfA       = input.timeframe("5",   "Zone TF 1", group=grpC)
 tfC       = input.timeframe("60",  "Zone TF 3", group=grpC)
 tfD       = input.timeframe("240", "Zone TF 4", group=grpC)
@@ -49,14 +49,14 @@ retWin    = input.int(12, "Retest within x bars of rejection", group=grpS)
 
 grpE = "Execution"
 slPct     = input.float(0.30, "Stop = x zone width beyond distal", step=0.05, group=grpE)
-targetR   = input.float(3.0,  "Target (R)", step=0.5, group=grpE)
+targetR   = input.float(2.0,  "Target (R)", step=0.5, group=grpE)
 noRoll    = input.bool(true,  "Skip contract-roll days", group=grpE)
 drawZones = input.bool(true,  "Draw traded zones", group=grpE)
 
 grpR = "Relaxations"
 useFVG = input.bool(true, "Require 3-bar imbalance", group=grpR)
 useBOS = input.bool(true, "Require break of structure", group=grpR)
-useDiv = input.bool(true, "Require RSI divergence", group=grpR)
+useDiv = input.bool(false, "Require RSI divergence", group=grpR)
 
 // ─────────── zone ───────────
 // stage 0 waiting for arrival, 1 arrived with divergence, 2 rejected, 3 finished

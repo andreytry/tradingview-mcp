@@ -2,13 +2,9 @@
 /**
  * Arm TradingView alerts for the two TradingView-tested v2 strategies.
  *
- * For each strategy already on the chart: write the backend's webhook secret into the
- * script's "Webhook secret" input, then create one strategy alert per symbol that fires
- * the script's own alert() JSON (OPEN and CLOSE) to the n8n bridge, which forwards to the
- * execution backend.
- *
- * The secret is fetched from the box at runtime and held only in memory. It is never
- * printed, logged or written to disk here, so it does not end up in a transcript.
+ * For each strategy already on the chart: write the validated configuration onto the
+ * chart instance, then create one strategy alert per symbol that fires the script's own
+ * alert() JSON (OPEN and CLOSE) to the n8n bridge, which forwards to the execution backend.
  */
 import { readFileSync } from 'node:fs';
 import { getState } from '../src/core/chart.js';
@@ -45,23 +41,7 @@ function inputIndex(pineUrl, name) {
   return i;
 }
 
-async function boxSecret() {
-  const url = env('/root/globextraps/.env', 'SUPABASE_URL');
-  const key = env('/root/globextraps/.env', 'SUPABASE_KEY');
-  if (!url || !key) throw new Error('SUPABASE_URL/SUPABASE_KEY missing locally');
-  const res = await fetch(url + '/functions/v1/ashburn-ssh', {
-    method: 'POST',
-    headers: { apikey: key, Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ cmd: "grep -E '^WEBHOOK_SECRET=' /home/claude/globextraps/.env | cut -d= -f2-", timeout_ms: 20000 }),
-  });
-  const j = await res.json();
-  const s = String(j.stdout || '').trim();
-  if (!s) throw new Error('could not read the webhook secret from the box (http ' + res.status + ')');
-  return s;
-}
-
-const secret = await boxSecret();
-console.log('secret loaded (length', secret.length + ')');
+// No secret: the alert payload no longer carries one and the backend gates none.
 
 // ONLY="SupplyDemandTrendReversal" arms one strategy; re-running for a strategy that already
 // has live alerts would create duplicates, since alerts are not keyed by anything.
@@ -76,7 +56,6 @@ for (const s of STRATEGIES) {
   const inputs = {};
   for (const [name, value] of Object.entries(s.config)) inputs['in_' + inputIndex(s.pine, name)] = value;
   inputs['in_' + inputIndex(s.pine, 'sendAlerts')] = true;
-  inputs['in_' + inputIndex(s.pine, 'webhookSecret')] = secret;
   const set = await setInputs({ entity_id: study.id, inputs });
   console.log(`${s.study}: inputs set ok=${!!(set && set.success !== false)}`);
   for (const sym of SYMBOLS) {

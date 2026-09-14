@@ -90,7 +90,8 @@ async function tvClose({ tvSymbol, side, qty }) {
       var ps = await b.api.positions();
       var want = ${side === 'LONG' ? 1 : -1};
       var p = (ps || []).filter(function(x){ return String(x.symbol).indexOf(${JSON.stringify(root)}) === 0 && x.side === want; })[0];
-      if (!p) return { ok: false, error: 'no open ' + ${JSON.stringify(side)} + ' position for ' + ${JSON.stringify(root)} + ' in Paper Trading' };
+      // Already flat: the attached stop or target filled first, which is the normal exit.
+      if (!p) return { ok: true, alreadyFlat: true, closed: ${JSON.stringify(root)}, qty: 0 };
       var q = Math.min(${Number(qty)}, p.qty);
       var r = await b.rt.closePosition(p.symbol, q);
       return { ok: true, closed: p.symbol, qty: q, raw: JSON.stringify(r).slice(0, 300) };
@@ -124,8 +125,8 @@ async function tick() {
       if (!(await claim(r.signal_id, 'open', { tv_status: 'closing' }))) continue;
       const res = await tvClose({ tvSymbol, side: r.side, qty: r.contracts || 1 });
       if (res && res.ok) {
-        await claim(r.signal_id, 'closing', { tv_status: 'closed', tv_error: null });
-        say('closed', { id: r.signal_id, closed: res.closed, qty: res.qty });
+        await claim(r.signal_id, 'closing', { tv_status: 'closed', tv_error: res.alreadyFlat ? 'already flat: bracket filled first' : null });
+        say('closed', { id: r.signal_id, closed: res.closed, qty: res.qty, alreadyFlat: !!res.alreadyFlat });
       } else {
         await claim(r.signal_id, 'closing', { tv_status: 'close_error', tv_error: String(res && res.error || 'unknown').slice(0, 500) });
         say('close_failed', { id: r.signal_id, error: res && res.error });

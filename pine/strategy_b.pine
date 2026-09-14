@@ -445,7 +445,10 @@ if showLive and atEdge
             if drawn >= 30
                 break
             color cz = z.dem ? #089981 : #f23645
-            array.push(vBx, box.new(z.born, z.top, bar_index + 12, z.bot,
+            // A drawing may not reference more than 10000 bars back. The alert servers load
+            // far more history than a chart, so a long-lived zone can sit beyond that and the
+            // whole script stops with a runtime error there while the chart looks fine.
+            array.push(vBx, box.new(math.max(z.born, bar_index - 9000), z.top, bar_index + 12, z.bot,
                  border_color=color.new(cz, 35), border_width=1, border_style=line.style_dashed,
                  bgcolor=color.new(cz, 92), text=str.tostring(z.conf) + "/4", text_size=size.tiny,
                  text_color=color.new(cz, 20), text_halign=text.align_left, text_valign=text.align_center))

@@ -68,6 +68,7 @@ async function clearZoneStudies() {
 }
 
 const out = [];
+const bySymbol = [];
 for (const strat of STRATEGIES) {
   await clearZoneStudies();
   const added = await addStudyFromSearch({ query: strat.script, match: strat.script });
@@ -93,6 +94,12 @@ for (const strat of STRATEGIES) {
       trades += seq.length; wins += seq.filter((r) => r > 0).length; seqAll.push(...seq);
       nets += m.net_profit || 0;
       symLine.push(`${sym.root}:${seq.length}t/${c.total >= 0 ? '+' : ''}${c.total}R`);
+      const w = seq.filter((r) => r > 0).length;
+      bySymbol.push({ strategy: strat.key, tf, symbol: sym.root, trades: seq.length, wins: w,
+        win_pct: seq.length ? +(100 * w / seq.length).toFixed(1) : null,
+        avg_r: seq.length ? +(c.total / seq.length).toFixed(3) : null, total_r: c.total, max_dd_r: c.dd,
+        profit_factor: m.profit_factor != null ? +m.profit_factor.toFixed(2) : null,
+        net_usd: Math.round(m.net_profit || 0) });
     }
     const c = curve(seqAll);
     const rec = { strategy: strat.key, tf, trades, wins,
@@ -103,4 +110,4 @@ for (const strat of STRATEGIES) {
     log(`  ${String(tf).padStart(3)}m  n=${String(trades).padStart(4)}  win=${String(rec.win_pct).padStart(5)}%  totalR=${String(c.total).padStart(8)}  avgR=${String(rec.avg_r).padStart(7)}  ddR=${String(c.dd).padStart(7)}  net=$${rec.net_usd}   [${symLine.join(' ')}]`);
   }
 }
-console.log(JSON.stringify(out, null, 2));
+console.log(JSON.stringify({ pooled: out, by_symbol: bySymbol, tested_at: new Date().toISOString() }, null, 2));

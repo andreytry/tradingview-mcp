@@ -386,6 +386,11 @@ vTf1 = input.timeframe("60",  "Context trend 1", group=grpV)
 vTf2 = input.timeframe("240", "Context trend 2", group=grpV)
 vTf3 = input.timeframe("D",   "Context trend 3", group=grpV)
 
+// A strategy without calc_on_every_tick only computes on confirmed bars, so on a live
+// chart barstate.islast can stay false until the current bar closes and nothing would be
+// drawn for up to a full bar. The last confirmed historical bar is the right edge then.
+atEdge = barstate.islast or barstate.islastconfirmedhistory
+
 // ---- higher-timeframe trend: that timeframe's close against its own 50 EMA ----
 tState() =>
     float e50 = ta.ema(close, 50)
@@ -414,7 +419,7 @@ if not inRth
 // Only zones still in play are drawn, each labelled with the confluence count that let
 // it into the book. Traded zones keep their own solid box drawn by the entry above.
 var array<box> vBx = array.new<box>()
-if showLive and barstate.islast
+if showLive and atEdge
     while array.size(vBx) > 0
         box.delete(array.pop(vBx))
     int drawn = 0
@@ -440,7 +445,7 @@ putLevel(float px, string nm, color c) =>
         array.push(vLn, line.new(bar_index - 250, px, bar_index + 12, px, color=color.new(c, 30), style=line.style_dotted))
         array.push(vLb, label.new(bar_index + 12, px, nm + " " + str.tostring(px, format.mintick),
              style=label.style_label_left, color=color.new(c, 88), textcolor=color.new(c, 0), size=size.tiny))
-if showLevels and barstate.islast
+if showLevels and atEdge
     while array.size(vLn) > 0
         line.delete(array.pop(vLn))
     while array.size(vLb) > 0
@@ -463,7 +468,7 @@ liveZones() =>
 var table vPanel = table.new(position.top_right, 2, 8, border_width=1, frame_width=1, frame_color=#363a45)
 pKey(int r, string s) => table.cell(vPanel, 0, r, s, text_color=#787b86, bgcolor=#1e222d, text_size=size.small, text_halign=text.align_left)
 pVal(int r, string s, color c) => table.cell(vPanel, 1, r, s, text_color=c, bgcolor=#1e222d, text_size=size.small, text_halign=text.align_right)
-if showPanel and barstate.islast
+if showPanel and atEdge
     table.cell(vPanel, 0, 0, "Supply/Demand REVERSAL", text_color=color.white, bgcolor=#2962ff, text_size=size.small, text_halign=text.align_left)
     table.cell(vPanel, 1, 0, syminfo.ticker + "  " + timeframe.period + "m", text_color=color.white, bgcolor=#2962ff, text_size=size.small, text_halign=text.align_right)
     pKey(1, "Trend " + vTf1)

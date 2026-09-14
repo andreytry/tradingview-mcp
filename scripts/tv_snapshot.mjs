@@ -24,13 +24,13 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY;
 // under, its chart timeframe, and the inputs that define the validated configuration.
 const STRATEGIES = [
   {
-    script: 'Strategy A - Reversal',
+    script: 'SupplyDemandTrendReversal',
     tag: 'reversal-a-v2',
     timeframe: '15',
     inputs: { in_1: 0.75, in_6: 2, in_12: 1.5, in_16: 2.0, in_19: true, in_20: true, in_21: false },
   },
   {
-    script: 'Strategy B - Trend Continuation',
+    script: 'SupplyDemandTrendContinuation',
     tag: 'continuation-b-v2',
     timeframe: '15',
     inputs: { in_1: 1.5, in_6: 1, in_7: '5', in_14: 100, in_15: 0, in_17: 3.0, in_22: 'off' },

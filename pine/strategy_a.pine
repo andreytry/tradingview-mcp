@@ -1,5 +1,5 @@
 //@version=5
-// STRATEGY A - REVERSAL
+// SUPPLY / DEMAND TREND REVERSAL   (was "Strategy A - Reversal")
 //
 // Fade the move arriving at a zone. Identical zone construction and identical 3-of-4
 // confluence filter as Strategy B. No trend filter - direction comes from the zone.
@@ -10,7 +10,7 @@
 //   rejection within 20 bars, a close 1.5 x ATR beyond the proximal edge, zone direction
 //   retest    within 12 bars, price returns to the proximal edge and closes back on side
 //   enter at that close, stop 30% of zone width beyond distal, target fixed 3R
-strategy("Strategy A - Reversal", overlay=true,
+strategy("SupplyDemandTrendReversal", overlay=true,
      max_boxes_count=500, max_labels_count=500, max_lines_count=100,
      initial_capital=10000, default_qty_type=strategy.fixed, default_qty_value=1,
      pyramiding=0, commission_type=strategy.commission.cash_per_order, commission_value=0.5,
@@ -233,6 +233,17 @@ webhookSecret = input.string("", "Webhook secret", group=grpW)
 
 var string sigId = na
 
+// Entry facts, captured when the order is placed and rendered by the visualisation block
+// at the foot of this script. Kept as vars, not inputs, so no input number moves.
+var int   sigBar  = na
+var bool  sigLong = false
+var float sigE    = na
+var float sigSl   = na
+var float sigTp   = na
+var float sigTop  = na
+var float sigBot  = na
+var int   sigConf = 0
+
 rsiv  = ta.rsi(close, rsiLen)
 atrCt = ta.atr(atrLen)
 
@@ -312,6 +323,14 @@ if canTrade and array.size(zB) > 0
                         float r  = math.abs(e - sl)
                         if r > 0 and (z.dem ? sl < e : sl > e)
                             float tp = z.dem ? e + targetR * r : e - targetR * r
+                            sigBar  := bar_index
+                            sigLong := z.dem
+                            sigE    := e
+                            sigSl   := sl
+                            sigTp   := tp
+                            sigTop  := z.top
+                            sigBot  := z.bot
+                            sigConf := z.conf
                             if z.dem
                                 strategy.entry("A-L", strategy.long)
                                 strategy.exit("A-L x", "A-L", stop=sl, limit=tp)
@@ -353,3 +372,135 @@ if sendAlerts and ta.change(strategy.closedtrades) > 0 and not na(sigId)
          ',"exit":' + str.tostring(exitPx, "#.#####") +
          ',"pnl":' + str.tostring(pnl, "#.##") +
          ',"bar_time":' + str.tostring(time_close) + '}', alert.freq_once_per_bar_close)
+
+
+// ═══════════════════════════ visualisation ═══════════════════════════
+// Display only. Nothing below places an order or changes a signal, and every input here
+// is declared after the webhook inputs on purpose: Pine numbers inputs by declaration
+// order, and an armed alert carries a snapshot keyed by that number.
+grpV = "Visuals"
+showLive   = input.bool(true, "Live zone book (not only traded zones)", group=grpV)
+showLevels = input.bool(true, "Prior-day and premarket levels", group=grpV)
+showPanel  = input.bool(true, "Context panel", group=grpV)
+showCheck  = input.bool(true, "Entry checklist label", group=grpV)
+vTf1 = input.timeframe("60",  "Context trend 1", group=grpV)
+vTf2 = input.timeframe("240", "Context trend 2", group=grpV)
+vTf3 = input.timeframe("D",   "Context trend 3", group=grpV)
+
+// ---- higher-timeframe trend: that timeframe's close against its own 50 EMA ----
+tState() =>
+    float e50 = ta.ema(close, 50)
+    close > e50 ? 1 : close < e50 ? -1 : 0
+vT1 = request.security(syminfo.tickerid, vTf1, tState(), lookahead=barmerge.lookahead_off)
+vT2 = request.security(syminfo.tickerid, vTf2, tState(), lookahead=barmerge.lookahead_off)
+vT3 = request.security(syminfo.tickerid, vTf3, tState(), lookahead=barmerge.lookahead_off)
+arrowOf(int d) => d > 0 ? "▲ up" : d < 0 ? "▼ down" : "→ flat"
+colOf(int d) => d > 0 ? #089981 : d < 0 ? #f23645 : #787b86
+
+// ---- prior day, and the overnight range that precedes the RTH open ----
+[pdH, pdL, pdC] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]], lookahead=barmerge.lookahead_off)
+inRth = not na(time(timeframe.period, "0930-1600", "America/New_York"))
+var float pmH = na
+var float pmL = na
+// The futures day starts at 18:00 ET, so the daily rollover is exactly where the
+// overnight session begins. Reset there and accumulate until the RTH open.
+if ta.change(time("D")) != 0
+    pmH := na
+    pmL := na
+if not inRth
+    pmH := na(pmH) ? high : math.max(pmH, high)
+    pmL := na(pmL) ? low  : math.min(pmL, low)
+
+// ---- the live zone book, rebuilt at the right edge ----
+// Only zones still in play are drawn, each labelled with the confluence count that let
+// it into the book. Traded zones keep their own solid box drawn by the entry above.
+var array<box> vBx = array.new<box>()
+if showLive and barstate.islast
+    while array.size(vBx) > 0
+        box.delete(array.pop(vBx))
+    int drawn = 0
+    if array.size(zB) > 0
+        for i = 0 to array.size(zB) - 1
+            Zone z = array.get(zB, i)
+            if z.stage == 3
+                continue
+            if drawn >= 30
+                break
+            color cz = z.dem ? #089981 : #f23645
+            array.push(vBx, box.new(z.born, z.top, bar_index + 12, z.bot,
+                 border_color=color.new(cz, 35), border_width=1, border_style=line.style_dashed,
+                 bgcolor=color.new(cz, 92), text=str.tostring(z.conf) + "/4", text_size=size.tiny,
+                 text_color=color.new(cz, 20), text_halign=text.align_left, text_valign=text.align_center))
+            drawn += 1
+
+// ---- prior-day and premarket levels ----
+var array<line>  vLn = array.new<line>()
+var array<label> vLb = array.new<label>()
+putLevel(float px, string nm, color c) =>
+    if not na(px)
+        array.push(vLn, line.new(bar_index - 250, px, bar_index + 12, px, color=color.new(c, 30), style=line.style_dotted))
+        array.push(vLb, label.new(bar_index + 12, px, nm + " " + str.tostring(px, format.mintick),
+             style=label.style_label_left, color=color.new(c, 88), textcolor=color.new(c, 0), size=size.tiny))
+if showLevels and barstate.islast
+    while array.size(vLn) > 0
+        line.delete(array.pop(vLn))
+    while array.size(vLb) > 0
+        label.delete(array.pop(vLb))
+    putLevel(pdH, "PDH", #787b86)
+    putLevel(pdL, "PDL", #787b86)
+    putLevel(pdC, "PDC", #787b86)
+    putLevel(pmH, "Premkt high", #2962ff)
+    putLevel(pmL, "Premkt low",  #2962ff)
+
+// ---- context panel ----
+liveZones() =>
+    int n = 0
+    if array.size(zB) > 0
+        for i = 0 to array.size(zB) - 1
+            if array.get(zB, i).stage != 3
+                n += 1
+    n
+
+var table vPanel = table.new(position.top_right, 2, 8, border_width=1, frame_width=1, frame_color=#363a45)
+pKey(int r, string s) => table.cell(vPanel, 0, r, s, text_color=#787b86, bgcolor=#1e222d, text_size=size.small, text_halign=text.align_left)
+pVal(int r, string s, color c) => table.cell(vPanel, 1, r, s, text_color=c, bgcolor=#1e222d, text_size=size.small, text_halign=text.align_right)
+if showPanel and barstate.islast
+    table.cell(vPanel, 0, 0, "Supply/Demand REVERSAL", text_color=color.white, bgcolor=#2962ff, text_size=size.small, text_halign=text.align_left)
+    table.cell(vPanel, 1, 0, syminfo.ticker + "  " + timeframe.period + "m", text_color=color.white, bgcolor=#2962ff, text_size=size.small, text_halign=text.align_right)
+    pKey(1, "Trend " + vTf1)
+    pVal(1, arrowOf(vT1), colOf(vT1))
+    pKey(2, "Trend " + vTf2)
+    pVal(2, arrowOf(vT2), colOf(vT2))
+    pKey(3, "Trend " + vTf3)
+    pVal(3, arrowOf(vT3), colOf(vT3))
+    pKey(4, "RSI " + str.tostring(rsiLen))
+    pVal(4, str.tostring(rsiv, "#.0") + (rsiv >= 70 ? "  overbought" : rsiv <= 30 ? "  oversold" : ""), rsiv >= 70 ? #f23645 : rsiv <= 30 ? #089981 : #d1d4dc)
+    pKey(5, "Divergence")
+    pVal(5, bullDiv ? "bullish" : bearDiv ? "bearish" : "none", bullDiv ? #089981 : bearDiv ? #f23645 : #787b86)
+    pKey(6, "Live zones")
+    pVal(6, str.tostring(liveZones()) + "   need " + str.tostring(needTF) + "/4", #d1d4dc)
+    pKey(7, "Position")
+    pVal(7, strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "flat",
+         strategy.position_size > 0 ? #089981 : strategy.position_size < 0 ? #f23645 : #787b86)
+
+// ---- entry checklist, as a hover tooltip on the entry marker ----
+if showCheck and not na(sigBar) and sigBar == bar_index
+    string tip = "SupplyDemandTrendReversal — why this entry" +
+         "\n\nZone         " + timeframe.period + "m " + (sigLong ? "demand" : "supply") + "  " +
+              str.tostring(sigBot, format.mintick) + " – " + str.tostring(sigTop, format.mintick) +
+         "\nConfluence   " + str.tostring(sigConf) + " of 4 timeframes agree (need " + str.tostring(needTF) + ")" +
+         "\nImbalance    " + (useFVG ? "3-bar FVG required, present" : "not required") +
+         "\nStructure    " + (useBOS ? "break of structure required, present" : "not required") +
+         "\nDivergence   " + (useDiv ? "RSI divergence required, present" : "not required") +
+         "\nSequence     arrival → rejection " + str.tostring(rejAtr) + " ATR beyond proximal → retest" +
+         "\nRSI(" + str.tostring(rsiLen) + ")      " + str.tostring(rsiv, "#.0") +
+         "\nTrend        " + vTf1 + " " + arrowOf(vT1) + "   " + vTf2 + " " + arrowOf(vT2) + "   " + vTf3 + " " + arrowOf(vT3) +
+         "\nPremarket    " + (na(pmH) ? "n/a" : str.tostring(pmL, format.mintick) + " – " + str.tostring(pmH, format.mintick)) +
+         "\nPrior day    " + str.tostring(pdL, format.mintick) + " – " + str.tostring(pdH, format.mintick) +
+         "\n\nEntry " + str.tostring(sigE, format.mintick) +
+              "   Stop " + str.tostring(sigSl, format.mintick) +
+              "   Target " + str.tostring(sigTp, format.mintick) +
+         "\nRisk " + str.tostring(math.abs(sigE - sigSl), format.mintick) + " points, target " + str.tostring(targetR) + "R"
+    label.new(bar_index, sigLong ? low : high, text=sigLong ? "▲ why" : "▼ why",
+         style=sigLong ? label.style_label_up : label.style_label_down,
+         color=color.new(sigLong ? #089981 : #f23645, 15), textcolor=color.white, size=size.small, tooltip=tip)

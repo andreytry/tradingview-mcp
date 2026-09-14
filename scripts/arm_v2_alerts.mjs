@@ -23,11 +23,11 @@ const SYMBOLS = ['COMEX_MINI:MGC1!', 'CME_MINI:MES1!', 'CBOT_MINI:MYM1!', 'CME_M
 // gets armed. Values are the TradingView-tested v2 settings (15m, 31 Mar - 11 Sep 2026).
 const STRATEGIES = [
   {
-    study: 'Strategy A - Reversal', pine: new URL('../pine/strategy_a.pine', import.meta.url),
+    study: 'SupplyDemandTrendReversal', pine: new URL('../pine/strategy_a.pine', import.meta.url),
     config: { legAtr: 0.75, needTF: 2, rejAtr: 1.5, targetR: 2.0, useFVG: true, useBOS: true, useDiv: false },
   },
   {
-    study: 'Strategy B - Trend Continuation', pine: new URL('../pine/strategy_b.pine', import.meta.url),
+    study: 'SupplyDemandTrendContinuation', pine: new URL('../pine/strategy_b.pine', import.meta.url),
     config: { legAtr: 1.5, needTF: 1, tfA: '5', rsiLongMax: 100, rsiShortMin: 0, targetR: 3.0, useFVG: true, useBOS: true, trendMode: 'off' },
   },
 ];
@@ -63,7 +63,7 @@ async function boxSecret() {
 const secret = await boxSecret();
 console.log('secret loaded (length', secret.length + ')');
 
-// ONLY="Strategy A - Reversal" arms one strategy; re-running for a strategy that already
+// ONLY="SupplyDemandTrendReversal" arms one strategy; re-running for a strategy that already
 // has live alerts would create duplicates, since alerts are not keyed by anything.
 const only = process.env.ONLY ? process.env.ONLY.split(',').map((x) => x.trim()) : null;
 

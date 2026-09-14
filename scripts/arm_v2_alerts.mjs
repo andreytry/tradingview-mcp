@@ -63,9 +63,14 @@ async function boxSecret() {
 const secret = await boxSecret();
 console.log('secret loaded (length', secret.length + ')');
 
+// ONLY="Strategy A - Reversal" arms one strategy; re-running for a strategy that already
+// has live alerts would create duplicates, since alerts are not keyed by anything.
+const only = process.env.ONLY ? process.env.ONLY.split(',').map((x) => x.trim()) : null;
+
 const st = await getState();
 const results = [];
 for (const s of STRATEGIES) {
+  if (only && !only.includes(s.study)) { console.log(`SKIP ${s.study}: not in ONLY`); continue; }
   const study = (st.studies || []).find((x) => x.name === s.study);
   if (!study) { console.log(`SKIP ${s.study}: not on the chart`); continue; }
   const inputs = {};

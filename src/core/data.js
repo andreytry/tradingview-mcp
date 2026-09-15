@@ -5,7 +5,7 @@ import { evaluate, evaluateAsync, KNOWN_PATHS, safeString } from '../connection.
 import { waitForChartReady } from '../wait.js';
 
 const MAX_OHLCV_BARS = 500;
-const MAX_TRADES = 20;
+const MAX_TRADES = 2000;   // orders, not trades: 20 capped every measurement at 10 pairs
 
 // Round to 8 dp — enough to kill float noise (29899.999999997 → 29900) without
 // destroying precision on forex/crypto prices. The old 2-dp rounding flattened
@@ -293,7 +293,7 @@ export async function getStrategyResults() {
 }
 
 export async function getTrades({ max_trades } = {}) {
-  const limit = Math.min(max_trades || 20, MAX_TRADES);
+  const limit = Math.min(max_trades || 20, MAX_TRADES);   // callers asking for more now get it
   const ready = await ensureStrategyTesterReady();
   const trades = await evaluate(`
     (function() {

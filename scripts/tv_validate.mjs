@@ -68,8 +68,18 @@ for (const cfg of cfgs) {
     await sleep(4000);
   }
   const inputs = {}; for (const [k, v] of Object.entries(cfg.inputs || {})) inputs['in_' + idxOf(cfg.pine, k)] = v;
-  await setInputs({ entity_id, inputs });
+  // Write ONLY what differs. Sending the whole input set at once leaves the strategy in a
+  // state where TradingView never recomputes its report: every symbol then reads as
+  // "no report", which looks like a timeout and is not one - no poll length fixes it.
+  // Measured on MNQ 5m: bare mount computes in 4s, a full 12-input write never returns,
+  // a single changed key recomputes in 5s.
+  const current = await evaluate(`(function(){var c=window.TradingViewApi.chart(0);
+    var st=c.getAllStudies().filter(function(s){return s.name===${JSON.stringify(cfg.study)}})[0];
+    if(!st)return null;var o={};c.getStudyById(st.id).getInputValues().forEach(function(v){o[v.id]=v.value});return o;})()`).catch(() => null);
+  if (current) for (const k of Object.keys(inputs)) if (current[k] === inputs[k]) delete inputs[k];
+  if (Object.keys(inputs).length) await setInputs({ entity_id, inputs });
   log(`\n### ${cfg.label}  (${cfg.study} @ ${cfg.timeframe}m)  ${JSON.stringify(cfg.inputs)}`);
+  log(`  changed inputs written: ${JSON.stringify(inputs)}`);
   let all = [], nets = 0, per = [];
   for (const [tv, root] of SYMBOLS) {
     await setSymbol({ symbol: tv }); await sleep(2800);

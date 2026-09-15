@@ -337,7 +337,8 @@ if canTrade and array.size(zB) > 0
                                 strategy.entry("A-S", strategy.short)
                                 strategy.exit("A-S x", "A-S", stop=sl, limit=tp)
                             if drawZones
-                                box.new(z.born, z.top, bar_index, z.bot,
+                                // Same 10000-bar drawing limit as the live book.
+                                box.new(math.max(z.born, bar_index - 9000), z.top, bar_index, z.bot,
                                      border_color = z.dem ? #089981 : #f23645,
                                      bgcolor = z.dem ? color.new(#089981, 80) : color.new(#f23645, 80))
                             // OPEN. The id is deterministic from symbol + bar so a

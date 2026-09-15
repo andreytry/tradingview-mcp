@@ -354,7 +354,9 @@ if barstate.isconfirmed and strategy.position_size == 0 and not na(atrCt) and ar
                     strategy.entry("B-S", strategy.short)
                     strategy.exit("B-S x", "B-S", stop=sl, limit=tp)
                 if drawZones
-                    box.new(z.born, z.top, bar_index, z.bot,
+                    // Same 10000-bar drawing limit as the live book: a zone born far
+                    // enough back is a runtime error that stops the entire script.
+                    box.new(math.max(z.born, bar_index - 9000), z.top, bar_index, z.bot,
                          border_color = z.dem ? #089981 : #f23645,
                          bgcolor = z.dem ? color.new(#089981, 80) : color.new(#f23645, 80))
                 // OPEN. The id is deterministic from symbol + bar time + side, so a

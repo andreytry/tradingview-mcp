@@ -51,6 +51,10 @@ slPct     = input.float(0.30, "Stop = x zone width beyond distal", step=0.05, gr
 targetR   = input.float(3.0,  "Target (R)", step=0.5, group=grpE)
 noRoll    = input.bool(true,  "Skip contract-roll days", group=grpE)
 drawZones = input.bool(true,  "Draw traded zones", group=grpE)
+// A zone may be traded this many times before it is retired. Declared here, with the
+// other execution inputs, because the entry loop below references it; the 6-month search
+// found 2 worth roughly double 1. Inputs after this one shift, so alerts must be re-armed.
+maxTouches = input.int(1, "Touches allowed per zone", minval=1, maxval=5, group=grpE)
 
 grpR = "Relaxations"
 useFVG    = input.bool(true,  "Require 3-bar imbalance", group=grpR)
@@ -63,7 +67,7 @@ type Zone
     float bot
     bool  dem
     int   born      // bar_index of the chart bar on which the zone was registered
-    bool  used
+    int   used      // touches consumed so far; the zone dies at maxTouches
     int   tdir      // 1h trend as it stood when the zone was registered
     int   conf      // confluence count, resolved once when the zone was registered
 
@@ -230,7 +234,7 @@ push(array<Zone> arr, bool ok, float t, float b, bool dem, int trendNow) =>
                     clash := true
                     break
         if not clash
-            array.unshift(arr, Zone.new(t, b, dem, bar_index, false, trendNow, 0))
+            array.unshift(arr, Zone.new(t, b, dem, bar_index, 0, trendNow, 0))
             if array.size(arr) > maxZones
                 array.pop(arr)
 
@@ -253,7 +257,7 @@ if okB and not na(tB) and not na(bB)
                     clashB := true
                     break
         if not clashB
-            array.unshift(zB, Zone.new(tB, bB, dB, bar_index, false, trend, cfB))
+            array.unshift(zB, Zone.new(tB, bB, dB, bar_index, 0, trend, cfB))
             if array.size(zB) > maxZones
                 array.pop(zB)
 
@@ -314,14 +318,14 @@ atrCt = ta.atr(atrLen)
 if barstate.isconfirmed and strategy.position_size == 0 and not na(atrCt) and array.size(zB) > 0 and (not noRoll or not isRollDay())
     for i = 0 to array.size(zB) - 1
         Zone z = array.get(zB, i)
-        if z.used or bar_index <= z.born
+        if z.used >= maxTouches or bar_index <= z.born
             continue
         float prox = z.dem ? z.top : z.bot
         float dist = z.dem ? z.bot : z.top
         bool touched = z.dem ? low <= prox : high >= prox
         if not touched
             continue
-        z.used := true                      // consumed on first touch, entered or not
+        z.used := z.used + 1                // a touch is spent whether or not it entered
         int  tuse  = trendWhen == "touch" ? trend : z.tdir
         // "off" means take the zone's own direction and impose no trend condition
         bool dirOk = trendMode == "off" ? true : (z.dem ? tuse == 1 : tuse == -1)
@@ -400,6 +404,7 @@ vTf1 = input.timeframe("60",  "Context trend 1", group=grpV)
 vTf2 = input.timeframe("240", "Context trend 2", group=grpV)
 vTf3 = input.timeframe("D",   "Context trend 3", group=grpV)
 
+
 // A strategy without calc_on_every_tick only computes on confirmed bars, so on a live
 // chart barstate.islast can stay false until the current bar closes and nothing would be
 // drawn for up to a full bar. The last confirmed historical bar is the right edge then.
@@ -440,7 +445,7 @@ if showLive and atEdge
     if array.size(zB) > 0
         for i = 0 to array.size(zB) - 1
             Zone z = array.get(zB, i)
-            if z.used
+            if z.used >= maxTouches
                 continue
             if drawn >= 30
                 break
@@ -478,7 +483,7 @@ liveZones() =>
     int n = 0
     if array.size(zB) > 0
         for i = 0 to array.size(zB) - 1
-            if not array.get(zB, i).used
+            if array.get(zB, i).used < maxTouches
                 n += 1
     n
 

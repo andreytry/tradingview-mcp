@@ -77,6 +77,14 @@ for (const cfg of cfgs) {
     var st=c.getAllStudies().filter(function(s){return s.name===${JSON.stringify(cfg.study)}})[0];
     if(!st)return null;var o={};c.getStudyById(st.id).getInputValues().forEach(function(v){o[v.id]=v.value});return o;})()`).catch(() => null);
   if (current) for (const k of Object.keys(inputs)) if (current[k] === inputs[k]) delete inputs[k];
+  // Guard: tfA is read with request.security_lower_tf, so it must stay at or below the
+  // chart timeframe. Writing a higher one silently stops the study computing.
+  try {
+    const tfaKey = 'in_' + idxOf(cfg.pine, 'tfA');
+    if (inputs[tfaKey] !== undefined && Number(inputs[tfaKey]) > Number(cfg.timeframe)) {
+      throw new Error(`tfA=${inputs[tfaKey]} exceeds the ${cfg.timeframe}m chart; request.security_lower_tf cannot serve it`);
+    }
+  } catch (e) { if (/exceeds the/.test(e.message)) throw e; }
   if (Object.keys(inputs).length) await setInputs({ entity_id, inputs });
   log(`\n### ${cfg.label}  (${cfg.study} @ ${cfg.timeframe}m)  ${JSON.stringify(cfg.inputs)}`);
   log(`  changed inputs written: ${JSON.stringify(inputs)}`);

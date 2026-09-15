@@ -75,6 +75,9 @@ var array<Zone> zA = array.new<Zone>()
 var array<Zone> zB = array.new<Zone>()
 var array<Zone> zC = array.new<Zone>()
 var array<Zone> zD = array.new<Zone>()
+// Every chart-timeframe zone that was detected, whether or not it cleared the
+// confluence gate. Display only - no entry ever reads this book.
+var array<Zone> zCand = array.new<Zone>()
 
 bodyOf(float o, float c) => math.abs(c - o)
 
@@ -248,6 +251,19 @@ if newD
     push(zD, okD, tD, bD, dD, trend)
 if okB and not na(tB) and not na(bB)
     int cfB = confAt(tB, bB, dB)
+    // Keep the candidate regardless of the gate, so the chart can show what was
+    // detected and why it did not qualify.
+    bool candClash = false
+    if array.size(zCand) > 0
+        for i = 0 to array.size(zCand) - 1
+            Zone q = array.get(zCand, i)
+            if q.dem == dB and q.bot <= tB and bB <= q.top
+                candClash := true
+                break
+    if not candClash
+        array.unshift(zCand, Zone.new(tB, bB, dB, bar_index, 0, trend, cfB))
+        if array.size(zCand) > 200
+            array.pop(zCand)
     if cfB >= needTF
         bool clashB = false
         if array.size(zB) > 0
@@ -269,6 +285,7 @@ killThrough(array<Zone> arr) =>
             if bar_index > z.born and ((z.dem and close < z.bot) or (not z.dem and close > z.top))
                 array.remove(arr, i)
 killThrough(zB)
+killThrough(zCand)
 
 // ─────────── contract roll ───────────
 isRollDay() =>
@@ -402,6 +419,7 @@ showLive   = input.bool(true, "Live zone book (not only traded zones)", group=gr
 showLevels = input.bool(true, "Prior-day and premarket levels", group=grpV)
 showPanel  = input.bool(true, "Context panel", group=grpV)
 showCheck  = input.bool(true, "Entry checklist label", group=grpV)
+showCandidates = input.bool(true, "Candidate zones (below the confluence threshold)", group=grpV)
 vTf1 = input.timeframe("60",  "Context trend 1", group=grpV)
 vTf2 = input.timeframe("240", "Context trend 2", group=grpV)
 vTf3 = input.timeframe("D",   "Context trend 3", group=grpV)
@@ -461,6 +479,30 @@ if showLive and atEdge
                  text_color=color.new(cz, 20), text_halign=text.align_left, text_valign=text.align_center))
             drawn += 1
 
+// ---- candidate zones: detected but below the confluence threshold ----
+// Drawn dotted and faint so a qualifying zone still stands out. This is what makes the
+// strategy legible when the live book is empty, which is most of the session.
+var array<box> vCand = array.new<box>()
+if showCandidates and atEdge
+    while array.size(vCand) > 0
+        box.delete(array.pop(vCand))
+    int cdrawn = 0
+    if array.size(zCand) > 0
+        for i = 0 to array.size(zCand) - 1
+            Zone z = array.get(zCand, i)
+            if z.used >= maxTouches
+                continue
+            if z.conf >= needTF
+                continue
+            if cdrawn >= 25
+                break
+            color cc = z.dem ? #089981 : #f23645
+            array.push(vCand, box.new(math.max(z.born, bar_index - 9000), z.top, bar_index + 12, z.bot,
+                 border_color=color.new(cc, 70), border_width=1, border_style=line.style_dotted,
+                 bgcolor=color.new(cc, 97), text=str.tostring(z.conf) + "/4", text_size=size.tiny,
+                 text_color=color.new(cc, 60), text_halign=text.align_right, text_valign=text.align_top))
+            cdrawn += 1
+
 // ---- prior-day and premarket levels ----
 var array<line>  vLn = array.new<line>()
 var array<label> vLb = array.new<label>()
@@ -505,8 +547,8 @@ if showPanel and atEdge
     pVal(4, str.tostring(rsiv, "#.0") + (rsiv >= 70 ? "  overbought" : rsiv <= 30 ? "  oversold" : ""), rsiv >= 70 ? #f23645 : rsiv <= 30 ? #089981 : #d1d4dc)
     pKey(5, "Trend filter")
     pVal(5, trendMode == "off" ? "off - zone sets direction" : trendMode + " " + arrowOf(trend), trendMode == "off" ? #787b86 : colOf(trend))
-    pKey(6, "Live zones")
-    pVal(6, str.tostring(liveZones()) + "   need " + str.tostring(needTF) + "/4", #d1d4dc)
+    pKey(6, "Zones live/cand")
+    pVal(6, str.tostring(liveZones()) + " / " + str.tostring(array.size(zCand)) + "   need " + str.tostring(needTF) + "/4", #d1d4dc)
     pKey(7, "Position")
     pVal(7, strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "flat",
          strategy.position_size > 0 ? #089981 : strategy.position_size < 0 ? #f23645 : #787b86)

@@ -85,7 +85,10 @@ for (const cfg of cfgs) {
       throw new Error(`tfA=${inputs[tfaKey]} exceeds the ${cfg.timeframe}m chart; request.security_lower_tf cannot serve it`);
     }
   } catch (e) { if (/exceeds the/.test(e.message)) throw e; }
-  if (Object.keys(inputs).length) await setInputs({ entity_id, inputs });
+  if (Object.keys(inputs).length) {
+    await setInputs({ entity_id, inputs });
+    for (let i = 0; i < 40; i++) { if (await evaluate(HAS_PERF).catch(() => false)) break; await sleep(2000); }
+  }
   log(`\n### ${cfg.label}  (${cfg.study} @ ${cfg.timeframe}m)  ${JSON.stringify(cfg.inputs)}`);
   log(`  changed inputs written: ${JSON.stringify(inputs)}`);
   let all = [], nets = 0, per = [];

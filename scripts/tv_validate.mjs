@@ -10,6 +10,7 @@ import { readFileSync } from 'node:fs';
 import { setSymbol, setTimeframe, getState, manageIndicator } from '../src/core/chart.js';
 import { addStudyFromSearch, setInputs } from '../src/core/indicators.js';
 import { getStrategyResults, getTrades } from '../src/core/data.js';
+import { evaluate } from '../src/connection.js';
 
 const cfgs = JSON.parse(readFileSync(process.argv[2], 'utf8'));
 const SYMBOLS = [['CME_MINI:MNQ1!','MNQ'],['CME_MINI:MES1!','MES'],['CBOT_MINI:MYM1!','MYM'],['CME_MINI:M2K1!','M2K'],['COMEX_MINI:MGC1!','MGC']];
@@ -19,8 +20,25 @@ const idxOf = (pine, name) => {
   const names = [...readFileSync(pine, 'utf8').matchAll(/^(\w+)\s*=\s*input\./gm)].map((m) => m[1]);
   const i = names.indexOf(name); if (i < 0) throw new Error('no input ' + name); return i;
 };
-async function ready(tries = 16) {
-  for (let i = 0; i < tries; i++) { const r = await getStrategyResults().catch(() => null); if (r?.success && r.metrics?.total_trades !== undefined) return r.metrics; await sleep(1500); }
+const HAS_PERF = `(function(){try{var chart=window.TradingViewApi._activeChartWidgetWV.value()._chartWidget;
+  var srcs=chart.model().model().dataSources();
+  for(var i=0;i<srcs.length;i++){var s=srcs[i];if(typeof s.reportData!=='function')continue;
+    var rd=s.reportData();if(rd&&typeof rd.value==='function')rd=rd.value();
+    if(rd&&rd.performance)return true;}return false;}catch(e){return false}})()`;
+/**
+ * After a bulk setInputs the strategy recomputes and its report is briefly absent, so
+ * getStrategyResults() returns nothing. Wait for reportData().performance to come back
+ * before reading metrics. The old 16 x 1.5s budget expired mid-recompute and every
+ * symbol reported "no report".
+ */
+async function ready(tries = 60) {
+  for (let i = 0; i < tries; i++) {
+    if (await evaluate(HAS_PERF).catch(() => false)) {
+      const r = await getStrategyResults().catch(() => null);
+      if (r?.success && r.metrics?.total_trades !== undefined) return r.metrics;
+    }
+    await sleep(2000);
+  }
   return null;
 }
 function rSeq(orders, targetR) {

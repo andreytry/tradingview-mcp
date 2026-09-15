@@ -24,7 +24,8 @@ const STRATEGIES = [
   },
   {
     study: 'SupplyDemandTrendContinuation', pine: new URL('../pine/strategy_b.pine', import.meta.url),
-    config: { legAtr: 1.5, needTF: 1, tfA: '5', rsiLongMax: 100, rsiShortMin: 0, targetR: 3.0, useFVG: true, useBOS: true, trendMode: 'off' },
+    resolution: '5',
+    config: { legAtr: 1.5, needTF: 2, tfA: '5', rsiLongMax: 100, rsiShortMin: 0, targetR: 3.0, useFVG: true, useBOS: true, trendMode: 'off', maxTouches: 2 },
   },
 ];
 
@@ -59,7 +60,7 @@ for (const s of STRATEGIES) {
   const set = await setInputs({ entity_id: study.id, inputs });
   console.log(`${s.study}: inputs set ok=${!!(set && set.success !== false)}`);
   for (const sym of SYMBOLS) {
-    const r = await createStrategyAlert({ symbol: sym, study_name: s.study, web_hook: WEBHOOK, resolution: '15', expiration_days: 60 });
+    const r = await createStrategyAlert({ symbol: sym, study_name: s.study, web_hook: WEBHOOK, resolution: s.resolution || '15', expiration_days: 60 });
     const ok = !!(r && r.success);
     results.push({ study: s.study, sym, ok, id: r && (r.alert_id || r.id), err: ok ? undefined : (r && r.error) });
     console.log(`  ${sym.padEnd(18)} ${ok ? 'ARMED id=' + (r.alert_id || r.id || '?') : 'FAILED ' + (r && r.error)}`);

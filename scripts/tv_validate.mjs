@@ -32,12 +32,23 @@ function rSeq(orders, targetR) {
 const curve = (s) => { let c=0,p=0,d=0; for (const r of s){ c+=r; p=Math.max(p,c); d=Math.min(d,c-p);} return {total:+c.toFixed(2), dd:+d.toFixed(2)}; };
 
 const out = [];
+const mounted = new Map();   // study name -> entity_id, added once and reused
 for (const cfg of cfgs) {
-  let st = await getState();
-  for (const s of st.studies || []) if (/SupplyDemandTrend|Strategy [AB] -/.test(s.name)) await manageIndicator({ action: 'remove', entity_id: s.id });
   await setTimeframe({ timeframe: String(cfg.timeframe) });
-  const added = await addStudyFromSearch({ query: cfg.study, match: cfg.study });
-  const entity_id = added?.entity_id; if (!entity_id) throw new Error('could not add ' + cfg.study);
+  let entity_id = mounted.get(cfg.study);
+  if (!entity_id) {
+    // A clean chart is required: leftover studies (including rows a fuzzy search click
+    // added by mistake) stop the tester computing a report at all.
+    const st = await getState();
+    for (const s of st.studies || []) await manageIndicator({ action: 'remove', entity_id: s.id });
+    await sleep(2000);
+    const added = await addStudyFromSearch({ query: cfg.study, match: cfg.study });
+    entity_id = added?.entity_id;
+    if (!entity_id) throw new Error('could not add ' + cfg.study);
+    if (added.added_from_search !== cfg.study) throw new Error(`search clicked "${added.added_from_search}", wanted "${cfg.study}"`);
+    mounted.set(cfg.study, entity_id);
+    await sleep(4000);
+  }
   const inputs = {}; for (const [k, v] of Object.entries(cfg.inputs || {})) inputs['in_' + idxOf(cfg.pine, k)] = v;
   await setInputs({ entity_id, inputs });
   log(`\n### ${cfg.label}  (${cfg.study} @ ${cfg.timeframe}m)  ${JSON.stringify(cfg.inputs)}`);

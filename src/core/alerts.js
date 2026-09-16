@@ -185,7 +185,12 @@ export async function createStrategyAlert({
         var payload = {
           conditions: [{
             type: 'strategy',
-            strategy_mode: 'strategy_and_alerts',
+            // 'alerts', not 'strategy_and_alerts': the latter also fires on every order
+            // fill, and an order-fill event posts TradingView's own text template
+            // ("<name>: {{strategy.order.action}} ...") rather than the script's JSON, which
+            // the backend rejects as unparseable_body. Only the Pine alert() calls carry
+            // the OPEN/CLOSE payload, so only those should reach the webhook.
+            strategy_mode: 'alerts',
             series: [{
               type: 'study',
               study: 'StrategyScript@tv-scripting-101',

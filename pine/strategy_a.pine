@@ -247,6 +247,12 @@ killThrough(zCand)
 grpW = "Webhook"
 sendAlerts    = input.bool(true, "Emit JSON alerts", group=grpW)
 
+// Traded-zone boxes are permanent - one per entry - so they are held here and culled to
+// tradedMax. Without this the 500-box pool empties on a long backtest and the script
+// stops with a runtime error.
+var array<box> vTraded = array.new<box>()
+tradedMax = 120
+
 var string sigId = na
 
 // Entry facts, captured when the order is placed and rendered by the visualisation block
@@ -355,9 +361,15 @@ if canTrade and array.size(zB) > 0
                                 strategy.exit("A-S x", "A-S", stop=sl, limit=tp)
                             if drawZones
                                 // Same 10000-bar drawing limit as the live book.
-                                box.new(math.max(z.born, bar_index - 9000), z.top, bar_index, z.bot,
+                                // These boxes are permanent - one per entry - so they must
+                                // be capped. max_boxes_count is 500, and a long backtest
+                                // takes far more entries than that; exhausting the pool is
+                                // a runtime error that stops the whole script.
+                                array.push(vTraded, box.new(math.max(z.born, bar_index - 9000), z.top, bar_index, z.bot,
                                      border_color = z.dem ? #089981 : #f23645,
-                                     bgcolor = z.dem ? color.new(#089981, 80) : color.new(#f23645, 80))
+                                     bgcolor = z.dem ? color.new(#089981, 80) : color.new(#f23645, 80)))
+                                while array.size(vTraded) > tradedMax
+                                    box.delete(array.shift(vTraded))
                             // OPEN. The id is deterministic from symbol + bar so a
                             // duplicate delivery is rejected by the backend, not doubled.
                             if sendAlerts

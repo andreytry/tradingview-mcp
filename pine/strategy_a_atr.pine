@@ -1,14 +1,16 @@
 //@version=5
-// SUPPLY / DEMAND TREND CONTINUATION   (was "Strategy B - Trend Continuation")
+// SUPPLY / DEMAND TREND REVERSAL   (was "Strategy A - Reversal")
 //
-// Follow the established move. Supply/demand zones are built independently on 5m, 15m,
-// 1h and 4h. A zone survives only if at least 3 of those 4 hold an overlapping,
-// same-direction zone at the same price, the other timeframe's zone confirmed first.
+// Fade the move arriving at a zone. Identical zone construction and identical 3-of-4
+// confluence filter as Strategy B. No trend filter - direction comes from the zone.
 //
-// Sequence, all on the 15m chart: price retraces into a qualifying zone, RSI is not
-// overextended, a rejection candle prints, enter at its close. No break, no retest -
-// that is Strategy A's job, and it is what stops the two colliding on one zone.
-strategy("SupplyDemandTrendContinuation", overlay=true,
+// Sequence, all on the 15m chart:
+//   arrival   price trades into the zone
+//   divergence RSI disagrees with price on the last two confirmed pivots within 40 bars
+//   rejection within 20 bars, a close 1.5 x ATR beyond the proximal edge, zone direction
+//   retest    within 12 bars, price returns to the proximal edge and closes back on side
+//   enter at that close, stop 30% of zone width beyond distal, target fixed 3R
+strategy("SupplyDemandTrendReversal_ATR", overlay=true,
      max_boxes_count=500, max_labels_count=500, max_lines_count=100,
      initial_capital=10000, default_qty_type=strategy.fixed, default_qty_value=1,
      pyramiding=0, commission_type=strategy.commission.cash_per_order, commission_value=0.5,
@@ -26,49 +28,57 @@ strategy("SupplyDemandTrendContinuation", overlay=true,
 
 grpZ = "Zone construction"
 atrLen    = input.int(14,   "ATR length", group=grpZ)
-legAtr    = input.float(1.5,"Leg-out body >= x ATR", step=0.1, group=grpZ)
+legAtr    = input.float(0.75,"Leg-out body >= x ATR", step=0.1, group=grpZ)
 baseMax   = input.int(3,    "Max base candles", group=grpZ)
 baseRatio = input.float(0.5,"Base body <= x next body", step=0.05, group=grpZ)
 swingLR   = input.int(2,    "Swing pivot left/right", group=grpZ)
 maxZones  = input.int(2000,  "Max live zones per timeframe", group=grpZ)
 
+// ---- zone detection, ported from "Supply Demand Zones Trading Strategy v5" ----
+// Declared here, with the other zone-construction inputs, because detect() below reads
+// them: Pine requires declaration before use. These are new scripts with no armed alerts,
+// so there is no input snapshot to preserve and the ordering is free.
+grpA = "Zone detection (ATR rules)"
+aLegAtr   = input.float(0.5,  "Leg-out body >= x ATR",         step=0.05, group=grpA)
+aLegRatio = input.float(0.25, "Leg-in body >= x leg-out body", step=0.05, group=grpA)
+aMaxSmall = input.int(10,     "Max base candles",              minval=1,  group=grpA)
+aWickRat  = input.float(10.0, "Base candle max wick / body",   step=0.5,  group=grpA)
+aSizeRat  = input.float(0.5,  "Base candle body <= x leg-out", step=0.05, group=grpA)
+
 grpC = "Confluence"
-needTF    = input.int(1, "Timeframes that must agree (of 4)", minval=1, maxval=4, group=grpC)
+needTF    = input.int(2, "Timeframes that must agree (of 4)", minval=1, maxval=4, group=grpC)
 tfA       = input.timeframe("5",   "Zone TF 1", group=grpC)
 tfC       = input.timeframe("60",  "Zone TF 3", group=grpC)
 tfD       = input.timeframe("240", "Zone TF 4", group=grpC)
 
-grpT = "Trend and entry"
-trendTF   = input.timeframe("60", "Trend timeframe", group=grpT)
-trendLeg  = input.int(3, "Consecutive HH+HL / LL+LH", group=grpT)
-rsiLen    = input.int(14, "RSI length", group=grpT)
-trendWhen = input.string("touch", "Trend sampled at", options=["touch", "zone birth"], group=grpT)
-rsiLongMax  = input.float(100, "Long: RSI below", group=grpT)
-rsiShortMin = input.float(0, "Short: RSI above", group=grpT)
+grpS = "Sequence"
+rsiLen    = input.int(14, "RSI length", group=grpS)
+divLook   = input.int(40, "Divergence pivots within x bars", group=grpS)
+rejAtr    = input.float(1.5, "Rejection close = x ATR beyond proximal", step=0.1, group=grpS)
+rejWin    = input.int(20, "Rejection within x bars of arrival", group=grpS)
+retWin    = input.int(12, "Retest within x bars of rejection", group=grpS)
 
 grpE = "Execution"
 slPct     = input.float(0.30, "Stop = x zone width beyond distal", step=0.05, group=grpE)
-targetR   = input.float(3.0,  "Target (R)", step=0.5, group=grpE)
+targetR   = input.float(2.0,  "Target (R)", step=0.5, group=grpE)
 noRoll    = input.bool(true,  "Skip contract-roll days", group=grpE)
 drawZones = input.bool(true,  "Draw traded zones", group=grpE)
-// A zone may be traded this many times before it is retired. Declared here, with the
-// other execution inputs, because the entry loop below references it; the 6-month search
-// found 2 worth roughly double 1. Inputs after this one shift, so alerts must be re-armed.
-maxTouches = input.int(1, "Touches allowed per zone", minval=1, maxval=5, group=grpE)
 
 grpR = "Relaxations"
-useFVG    = input.bool(true,  "Require 3-bar imbalance", group=grpR)
-useBOS    = input.bool(true,  "Require break of structure", group=grpR)
-trendMode = input.string("off", "Trend definition", options=["hh_hl", "htf_candle", "off"], group=grpR)
+useFVG = input.bool(true, "Require 3-bar imbalance", group=grpR)
+useBOS = input.bool(true, "Require break of structure", group=grpR)
+useDiv = input.bool(false, "Require RSI divergence", group=grpR)
 
 // ─────────── zone ───────────
+// stage 0 waiting for arrival, 1 arrived with divergence, 2 rejected, 3 finished
 type Zone
     float top
     float bot
     bool  dem
-    int   born      // bar_index of the chart bar on which the zone was registered
-    int   used      // touches consumed so far; the zone dies at maxTouches
-    int   tdir      // 1h trend as it stood when the zone was registered
+    int   born
+    int   stage
+    int   tArr
+    int   tRej
     int   conf      // confluence count, resolved once when the zone was registered
 
 var array<Zone> zA = array.new<Zone>()
@@ -81,18 +91,8 @@ var array<Zone> zCand = array.new<Zone>()
 
 bodyOf(float o, float c) => math.abs(c - o)
 
-// ─────────── detection, evaluated inside each timeframe's own context ───────────
 detect() =>
     float a  = ta.atr(atrLen)
-    float ph = ta.pivothigh(high, swingLR, swingLR)
-    float pl = ta.pivotlow(low, swingLR, swingLR)
-    var float lastPH = na
-    var float lastPL = na
-    if not na(ph)
-        lastPH := ph
-    if not na(pl)
-        lastPL := pl
-
     float lo   = bodyOf(open, close)
     bool  bull = close > open
     float zt = na
@@ -100,21 +100,45 @@ detect() =>
     bool  dem = false
     bool  ok  = false
 
-    if not na(a) and a > 0 and lo >= legAtr * a and close != open
-        // base: up to baseMax candles, each body <= baseRatio x the body that follows it
-        // each base candle is measured against the LEG-OUT body, not the candle after it.
-        // Chaining it makes candle 2 need <=25% and candle 3 <=12.5%, which all but
-        // removes multi-candle bases and builds zones that are far too narrow.
-        int n = 0
-        while n < baseMax and bodyOf(open[1 + n], close[1 + n]) <= lo * baseRatio
-            n += 1
-        if n >= 1
-            bool bos = not useBOS or (bull ? (not na(lastPH) and close > lastPH) : (not na(lastPL) and close < lastPL))
+    // Leg-out must clear aLegAtr x ATR, then a base of small candles, then a leg-in
+    // that still carries aLegRatio of the leg-out body. Ported from the source script;
+    // confluence, entry, risk and alerts below are unchanged.
+    if not na(a) and a > 0 and lo >= aLegAtr * a and close != open
+        int   small = 0
+        int   idx   = 1
+        bool  found = false
+        int   legIn = -1
+        while idx <= aMaxSmall and idx < 300
+            float sO = open[idx]
+            float sC = close[idx]
+            float sH = high[idx]
+            float sL = low[idx]
+            if na(sO) or na(sC) or na(sH) or na(sL)
+                break
+            float sBody = bodyOf(sO, sC)
+            if small >= 1 and sBody >= lo * aLegRatio
+                found := true
+                legIn := idx
+                break
+            float upW = sH - math.max(sO, sC)
+            float dnW = math.min(sO, sC) - sL
+            bool wickOk = sBody > 0 and math.max(upW, dnW) <= sBody * aWickRat
+            bool sizeOk = sBody <= lo * aSizeRat
+            if wickOk and sizeOk
+                small += 1
+                idx   += 1
+            else
+                break
+        if not found and small >= 1
+            found := true
+            legIn := math.min(idx, 299)
+        if found and legIn > 0 and small >= 1
+            bool bos = not useBOS or (bull ? close > ta.highest(high, 20)[1] : close < ta.lowest(low, 20)[1])
             bool fvg = not useFVG or (bull ? (high[2] < low) : (low[2] > high))
             if bos and fvg
                 float t = high[1]
                 float b = low[1]
-                for i = 1 to n
+                for i = 1 to small
                     t := math.max(t, high[i])
                     b := math.min(b, low[i])
                 if t > b
@@ -145,50 +169,11 @@ aBot = request.security_lower_tf(syminfo.tickerid, tfA, detBot())
 aDem = request.security_lower_tf(syminfo.tickerid, tfA, detDem())
 [okC, tC, bC, dC] = request.security(syminfo.tickerid, tfC, detect(), lookahead=barmerge.lookahead_off)
 [okD, tD, bD, dD] = request.security(syminfo.tickerid, tfD, detect(), lookahead=barmerge.lookahead_off)
-// the entry timeframe is the chart timeframe, so detect it directly - no security round trip
 [okB, tB, bB, dB] = detect()
 
 newC = ta.change(time(tfC)) != 0
 newD = ta.change(time(tfD)) != 0
 
-// ─────────── 1h trend: trendLeg consecutive higher highs AND higher lows ───────────
-trendCalc() =>
-    float ph = ta.pivothigh(high, swingLR, swingLR)
-    float pl = ta.pivotlow(low, swingLR, swingLR)
-    var array<float> hs = array.new<float>()
-    var array<float> ls = array.new<float>()
-    if not na(ph)
-        array.push(hs, ph)
-        if array.size(hs) > 20
-            array.shift(hs)
-    if not na(pl)
-        array.push(ls, pl)
-        if array.size(ls) > 20
-            array.shift(ls)
-    int dir = 0
-    if array.size(hs) > trendLeg and array.size(ls) > trendLeg
-        bool up = true
-        bool dn = true
-        for k = 0 to trendLeg - 1
-            float h1 = array.get(hs, array.size(hs) - 1 - k)
-            float h0 = array.get(hs, array.size(hs) - 2 - k)
-            float l1 = array.get(ls, array.size(ls) - 1 - k)
-            float l0 = array.get(ls, array.size(ls) - 2 - k)
-            if not (h1 > h0 and l1 > l0)
-                up := false
-            if not (h1 < h0 and l1 < l0)
-                dn := false
-        dir := up ? 1 : dn ? -1 : 0
-    dir
-
-trendStruct = request.security(syminfo.tickerid, trendTF, trendCalc(), lookahead=barmerge.lookahead_off)
-htfC = request.security(syminfo.tickerid, trendTF, close[1], lookahead=barmerge.lookahead_off)
-htfO = request.security(syminfo.tickerid, trendTF, open[1],  lookahead=barmerge.lookahead_off)
-trendCandle = htfC > htfO ? 1 : htfC < htfO ? -1 : 0
-trend = trendMode == "hh_hl" ? trendStruct : trendMode == "htf_candle" ? trendCandle : 0
-
-// ─────────── confluence ───────────
-// overlap, not containment; the other timeframe's zone must be the older one
 hasOverlap(array<Zone> arr, float t, float b, bool dem, int bornAt) =>
     bool found = false
     if array.size(arr) > 0
@@ -211,10 +196,9 @@ confluence(float t, float b, bool dem, int bornAt) =>
         c += 1
     c
 
-
 // Confluence is counted ONCE, when the zone is created, against every zone ever
 // detected on the other timeframes - not against a pruned "still alive" book, and not
-// re-counted later at the touch. Both of those starve the count to almost nothing.
+// re-counted later at the retest. Both of those starve the count to almost nothing.
 confAt(float t, float b, bool dem) =>
     int c = 1
     if hasOverlap(zA, t, b, dem, bar_index)
@@ -225,10 +209,8 @@ confAt(float t, float b, bool dem) =>
         c += 1
     c
 
-push(array<Zone> arr, bool ok, float t, float b, bool dem, int trendNow) =>
+push(array<Zone> arr, bool ok, float t, float b, bool dem) =>
     if ok and not na(t) and not na(b)
-        // keep the older of two overlapping same-direction zones on one timeframe,
-        // otherwise a slow grind stacks near-identical zones and confluence is noise
         bool clash = false
         if array.size(arr) > 0
             for i = 0 to array.size(arr) - 1
@@ -237,18 +219,18 @@ push(array<Zone> arr, bool ok, float t, float b, bool dem, int trendNow) =>
                     clash := true
                     break
         if not clash
-            array.unshift(arr, Zone.new(t, b, dem, bar_index, 0, trendNow, 0))
+            array.unshift(arr, Zone.new(t, b, dem, bar_index, 0, 0, 0, 0))
             if array.size(arr) > maxZones
                 array.pop(arr)
 
 if array.size(aOk) > 0
     for k = 0 to array.size(aOk) - 1
         if array.get(aOk, k) > 0.5
-            push(zA, true, array.get(aTop, k), array.get(aBot, k), array.get(aDem, k) > 0.5, trend)
+            push(zA, true, array.get(aTop, k), array.get(aBot, k), array.get(aDem, k) > 0.5)
 if newC
-    push(zC, okC, tC, bC, dC, trend)
+    push(zC, okC, tC, bC, dC)
 if newD
-    push(zD, okD, tD, bD, dD, trend)
+    push(zD, okD, tD, bD, dD)
 if okB and not na(tB) and not na(bB)
     int cfB = confAt(tB, bB, dB)
     // Keep the candidate regardless of the gate, so the chart can show what was
@@ -261,7 +243,7 @@ if okB and not na(tB) and not na(bB)
                 candClash := true
                 break
     if not candClash
-        array.unshift(zCand, Zone.new(tB, bB, dB, bar_index, 0, trend, cfB))
+        array.unshift(zCand, Zone.new(tB, bB, dB, bar_index, 0, 0, 0, cfB))
         if array.size(zCand) > 200
             array.pop(zCand)
     if cfB >= needTF
@@ -273,11 +255,10 @@ if okB and not na(tB) and not na(bB)
                     clashB := true
                     break
         if not clashB
-            array.unshift(zB, Zone.new(tB, bB, dB, bar_index, 0, trend, cfB))
+            array.unshift(zB, Zone.new(tB, bB, dB, bar_index, 0, 0, 0, cfB))
             if array.size(zB) > maxZones
                 array.pop(zB)
 
-// a zone dies when price closes clean through its distal edge
 killThrough(array<Zone> arr) =>
     if array.size(arr) > 0
         for i = array.size(arr) - 1 to 0
@@ -287,32 +268,15 @@ killThrough(array<Zone> arr) =>
 killThrough(zB)
 killThrough(zCand)
 
-// ─────────── contract roll ───────────
-isRollDay() =>
-    int m = month(time)
-    bool q = m == 3 or m == 6 or m == 9 or m == 12
-    q and dayofmonth(time) >= 8 and dayofmonth(time) <= 15
-
-// ─────────── rejection candle ───────────
-rejects(bool long) =>
-    float rng = high - low
-    float bd  = bodyOf(open, close)
-    float upW = high - math.max(open, close)
-    float dnW = math.min(open, close) - low
-    bool wick = long ? (rng > 0 and dnW >= 0.5 * rng and dnW >= 1.5 * bd)
-                     : (rng > 0 and upW >= 0.5 * rng and upW >= 1.5 * bd)
-    bool eng  = long ? (close > open and close[1] < open[1] and close >= open[1] and open <= close[1])
-                     : (close < open and close[1] > open[1] and close <= open[1] and open >= close[1])
-    bool brk  = long ? close > high[1] : close < low[1]
-    wick or eng or brk
-
+// ─────────── RSI divergence on the last two confirmed chart pivots ───────────
 // Declared LAST on purpose. Pine numbers inputs by declaration order, so adding one
 // anywhere above would silently renumber every saved input on the chart.
 grpW = "Webhook"
 sendAlerts    = input.bool(true, "Emit JSON alerts", group=grpW)
 
-// Traded-zone boxes are permanent, so they are held here and culled to tradedMax.
-// Without this the 500-box pool empties on a long backtest and the script dies.
+// Traded-zone boxes are permanent - one per entry - so they are held here and culled to
+// tradedMax. Without this the 500-box pool empties on a long backtest and the script
+// stops with a runtime error.
 var array<box> vTraded = array.new<box>()
 tradedMax = 120
 
@@ -320,90 +284,134 @@ var string sigId = na
 
 // Entry facts, captured when the order is placed and rendered by the visualisation block
 // at the foot of this script. Kept as vars, not inputs, so no input number moves.
-var int   sigBar   = na
-var bool  sigLong  = false
-var float sigE     = na
-var float sigSl    = na
-var float sigTp    = na
-var float sigTop   = na
-var float sigBot   = na
-var int   sigConf  = 0
-var int   sigTrend = 0
-var float sigRsi   = na
+var int   sigBar  = na
+var bool  sigLong = false
+var float sigE    = na
+var float sigSl   = na
+var float sigTp   = na
+var float sigTop  = na
+var float sigBot  = na
+var int   sigConf = 0
 
 rsiv  = ta.rsi(close, rsiLen)
 atrCt = ta.atr(atrLen)
 
-// ─────────── entry ───────────
-// A zone arms on the bar AFTER it is registered. Without that the leg-out candle that
-// creates the zone is itself still inside it, so every zone is consumed at birth.
-if barstate.isconfirmed and strategy.position_size == 0 and not na(atrCt) and array.size(zB) > 0 and (not noRoll or not isRollDay())
+ph15 = ta.pivothigh(high, swingLR, swingLR)
+pl15 = ta.pivotlow(low, swingLR, swingLR)
+
+var float pHi1 = na, var float pHi0 = na       // price at last / previous pivot high
+var float rHi1 = na, var float rHi0 = na       // RSI at the same pivots
+var int   tHi1 = na, var int   tHi0 = na
+var float pLo1 = na, var float pLo0 = na
+var float rLo1 = na, var float rLo0 = na
+var int   tLo1 = na, var int   tLo0 = na
+
+if not na(ph15)
+    pHi0 := pHi1
+    rHi0 := rHi1
+    tHi0 := tHi1
+    pHi1 := ph15
+    rHi1 := rsiv[swingLR]
+    tHi1 := bar_index - swingLR
+if not na(pl15)
+    pLo0 := pLo1
+    rLo0 := rLo1
+    tLo0 := tLo1
+    pLo1 := pl15
+    rLo1 := rsiv[swingLR]
+    tLo1 := bar_index - swingLR
+
+// supply: higher high in price, lower high in RSI. demand: lower low, higher low in RSI.
+bearDiv = not na(pHi0) and not na(rHi0) and pHi1 > pHi0 and rHi1 < rHi0 and (bar_index - tHi0) <= divLook
+bullDiv = not na(pLo0) and not na(rLo0) and pLo1 < pLo0 and rLo1 > rLo0 and (bar_index - tLo0) <= divLook
+
+isRollDay() =>
+    int m = month(time)
+    bool q = m == 3 or m == 6 or m == 9 or m == 12
+    q and dayofmonth(time) >= 8 and dayofmonth(time) <= 15
+
+// ─────────── sequence state machine ───────────
+canTrade = barstate.isconfirmed and not na(atrCt) and (not noRoll or not isRollDay())
+
+if canTrade and array.size(zB) > 0
     for i = 0 to array.size(zB) - 1
         Zone z = array.get(zB, i)
-        if z.used >= maxTouches or bar_index <= z.born
+        if z.stage == 3 or bar_index <= z.born
             continue
         float prox = z.dem ? z.top : z.bot
         float dist = z.dem ? z.bot : z.top
-        bool touched = z.dem ? low <= prox : high >= prox
-        if not touched
-            continue
-        z.used := z.used + 1                // a touch is spent whether or not it entered
-        int  tuse  = trendWhen == "touch" ? trend : z.tdir
-        // "off" means take the zone's own direction and impose no trend condition
-        bool dirOk = trendMode == "off" ? true : (z.dem ? tuse == 1 : tuse == -1)
-        bool rsiOk = z.dem ? rsiv < rsiLongMax : rsiv > rsiShortMin
-        if dirOk and rsiOk and rejects(z.dem)
-            float w  = z.top - z.bot
-            float sl = z.dem ? dist - w * slPct : dist + w * slPct
-            float e  = close
-            float r  = math.abs(e - sl)
-            if r > 0 and (z.dem ? sl < e : sl > e)
-                float tp = z.dem ? e + targetR * r : e - targetR * r
-                sigBar   := bar_index
-                sigLong  := z.dem
-                sigE     := e
-                sigSl    := sl
-                sigTp    := tp
-                sigTop   := z.top
-                sigBot   := z.bot
-                sigConf  := z.conf
-                sigTrend := tuse
-                sigRsi   := rsiv
-                if z.dem
-                    strategy.entry("B-L", strategy.long)
-                    strategy.exit("B-L x", "B-L", stop=sl, limit=tp)
+
+        if z.stage == 0
+            bool arrived = z.dem ? low <= prox : high >= prox
+            if arrived
+                bool div = not useDiv or (z.dem ? bullDiv : bearDiv)
+                if div
+                    z.stage := 1
+                    z.tArr  := bar_index
                 else
-                    strategy.entry("B-S", strategy.short)
-                    strategy.exit("B-S x", "B-S", stop=sl, limit=tp)
-                if drawZones
-                    // Same 10000-bar drawing limit as the live book: a zone born far
-                    // enough back is a runtime error that stops the entire script.
-                    // These boxes are permanent (one per entry, marking the zone that
-                    // was traded), so they MUST be capped: max_boxes_count is 500 and a
-                    // months-long 5m backtest takes far more entries than that, which
-                    // exhausts the pool and stops the whole script with a runtime error.
-                    // Keep the most recent tradedMax and delete the oldest beyond it.
-                    array.push(vTraded, box.new(math.max(z.born, bar_index - 9000), z.top, bar_index, z.bot,
-                         border_color = z.dem ? #089981 : #f23645,
-                         bgcolor = z.dem ? color.new(#089981, 80) : color.new(#f23645, 80)))
-                    while array.size(vTraded) > tradedMax
-                        box.delete(array.shift(vTraded))
-                // OPEN. The id is deterministic from symbol + bar time + side, so a
-                // duplicate delivery is rejected by the backend rather than doubled.
-                if sendAlerts
-                    sigId := syminfo.ticker + "-" + str.tostring(time) + "-" + (z.dem ? "L" : "S")
-                    alert('{"v":1' +
-                         ',"strategy":"continuation-b-v2"' +
-                         ',"event":"OPEN"' +
-                         ',"id":"' + sigId + '"' +
-                         ',"symbol":"' + syminfo.ticker + '"' +
-                         ',"side":"' + (z.dem ? "LONG" : "SHORT") + '"' +
-                         ',"entry":' + str.tostring(e, "#.#####") +
-                         ',"stop":' + str.tostring(sl, "#.#####") +
-                         ',"target":' + str.tostring(tp, "#.#####") +
-                         ',"atr":' + str.tostring(atrCt, "#.#####") +
-                         ',"bar_time":' + str.tostring(time_close) + '}', alert.freq_once_per_bar_close)
-            break
+                    z.stage := 3            // no divergence, discard the zone
+        else if z.stage == 1
+            if bar_index - z.tArr > rejWin
+                z.stage := 3
+            else
+                bool rej = z.dem ? close >= prox + rejAtr * atrCt : close <= prox - rejAtr * atrCt
+                if rej
+                    z.stage := 2
+                    z.tRej  := bar_index
+        else if z.stage == 2
+            if bar_index - z.tRej > retWin
+                z.stage := 3
+            else
+                bool back = z.dem ? (low <= prox and close > prox) : (high >= prox and close < prox)
+                if back
+                    z.stage := 3
+                    if strategy.position_size == 0
+                        float w  = z.top - z.bot
+                        float sl = z.dem ? dist - w * slPct : dist + w * slPct
+                        float e  = close
+                        float r  = math.abs(e - sl)
+                        if r > 0 and (z.dem ? sl < e : sl > e)
+                            float tp = z.dem ? e + targetR * r : e - targetR * r
+                            sigBar  := bar_index
+                            sigLong := z.dem
+                            sigE    := e
+                            sigSl   := sl
+                            sigTp   := tp
+                            sigTop  := z.top
+                            sigBot  := z.bot
+                            sigConf := z.conf
+                            if z.dem
+                                strategy.entry("A-L", strategy.long)
+                                strategy.exit("A-L x", "A-L", stop=sl, limit=tp)
+                            else
+                                strategy.entry("A-S", strategy.short)
+                                strategy.exit("A-S x", "A-S", stop=sl, limit=tp)
+                            if drawZones
+                                // Same 10000-bar drawing limit as the live book.
+                                // These boxes are permanent - one per entry - so they must
+                                // be capped. max_boxes_count is 500, and a long backtest
+                                // takes far more entries than that; exhausting the pool is
+                                // a runtime error that stops the whole script.
+                                array.push(vTraded, box.new(math.max(z.born, bar_index - 9000), z.top, bar_index, z.bot,
+                                     border_color = z.dem ? #089981 : #f23645,
+                                     bgcolor = z.dem ? color.new(#089981, 80) : color.new(#f23645, 80)))
+                                while array.size(vTraded) > tradedMax
+                                    box.delete(array.shift(vTraded))
+                            // OPEN. The id is deterministic from symbol + bar so a
+                            // duplicate delivery is rejected by the backend, not doubled.
+                            if sendAlerts
+                                sigId := syminfo.ticker + "-" + str.tostring(time) + "-" + (z.dem ? "L" : "S")
+                                alert('{"v":1' +
+                                     ',"strategy":"reversal-a-atr"' +
+                                     ',"event":"OPEN"' +
+                                     ',"id":"' + sigId + '"' +
+                                     ',"symbol":"' + syminfo.ticker + '"' +
+                                     ',"side":"' + (z.dem ? "LONG" : "SHORT") + '"' +
+                                     ',"entry":' + str.tostring(e, "#.#####") +
+                                     ',"stop":' + str.tostring(sl, "#.#####") +
+                                     ',"target":' + str.tostring(tp, "#.#####") +
+                                     ',"atr":' + str.tostring(atrCt, "#.#####") +
+                                     ',"bar_time":' + str.tostring(time_close) + '}', alert.freq_once_per_bar_close)
 
 
 // ─────────── CLOSE ───────────
@@ -413,7 +421,7 @@ if sendAlerts and ta.change(strategy.closedtrades) > 0 and not na(sigId)
     float pnl = strategy.closedtrades.profit(strategy.closedtrades - 1)
     float exitPx = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
     alert('{"v":1' +
-         ',"strategy":"continuation-b-v2"' +
+         ',"strategy":"reversal-a-atr"' +
          ',"event":"CLOSE"' +
          ',"signalId":"' + sigId + '"' +
          ',"symbol":"' + syminfo.ticker + '"' +
@@ -432,13 +440,10 @@ showLevels = input.bool(true, "Prior-day and premarket levels", group=grpV)
 showPanel  = input.bool(true, "Context panel", group=grpV)
 showCheck  = input.bool(true, "Entry checklist label", group=grpV)
 showCandidates = input.bool(true, "Candidate zones (below the confluence threshold)", group=grpV)
-// Declared before the timeframe inputs but after every gate input, so no entry-affecting
-// index moves. Collapsed shows only the header row; the panel is then two cells tall.
 panelOpen  = input.bool(true, "Context panel expanded", group=grpV)
 vTf1 = input.timeframe("60",  "Context trend 1", group=grpV)
 vTf2 = input.timeframe("240", "Context trend 2", group=grpV)
 vTf3 = input.timeframe("D",   "Context trend 3", group=grpV)
-
 
 // A strategy without calc_on_every_tick only computes on confirmed bars, so on a live
 // chart barstate.islast can stay false until the current bar closes and nothing would be
@@ -470,8 +475,8 @@ if not inRth
     pmL := na(pmL) ? low  : math.min(pmL, low)
 
 // ---- the live zone book, rebuilt at the right edge ----
-// Only zones still in play are drawn - a zone is consumed on first touch, entered or not -
-// each labelled with the confluence count that let it into the book.
+// Only zones still in play are drawn, each labelled with the confluence count that let
+// it into the book. Traded zones keep their own solid box drawn by the entry above.
 var array<box> vBx = array.new<box>()
 if showLive and atEdge
     while array.size(vBx) > 0
@@ -480,7 +485,7 @@ if showLive and atEdge
     if array.size(zB) > 0
         for i = 0 to array.size(zB) - 1
             Zone z = array.get(zB, i)
-            if z.used >= maxTouches
+            if z.stage == 3
                 continue
             if drawn >= 30
                 break
@@ -505,7 +510,7 @@ if showCandidates and atEdge
     if array.size(zCand) > 0
         for i = 0 to array.size(zCand) - 1
             Zone z = array.get(zCand, i)
-            if z.used >= maxTouches
+            if z.stage == 3
                 continue
             if z.conf >= needTF
                 continue
@@ -542,7 +547,7 @@ liveZones() =>
     int n = 0
     if array.size(zB) > 0
         for i = 0 to array.size(zB) - 1
-            if array.get(zB, i).used < maxTouches
+            if array.get(zB, i).stage != 3
                 n += 1
     n
 
@@ -550,10 +555,8 @@ var table vPanel = table.new(position.top_right, 2, 8, border_width=1, frame_wid
 pKey(int r, string s) => table.cell(vPanel, 0, r, s, text_color=#787b86, bgcolor=#1e222d, text_size=size.small, text_halign=text.align_left)
 pVal(int r, string s, color c) => table.cell(vPanel, 1, r, s, text_color=c, bgcolor=#1e222d, text_size=size.small, text_halign=text.align_right)
 if showPanel and atEdge
-    // Collapsed: header only, and every other cell is blanked so no stale row survives
-    // from a bar when the panel was open.
-    table.cell(vPanel, 0, 0, (panelOpen ? "▾ " : "▸ ") + "Supply/Demand CONTINUATION", text_color=color.white, bgcolor=#089981, text_size=size.small, text_halign=text.align_left)
-    table.cell(vPanel, 1, 0, syminfo.ticker + "  " + timeframe.period + "m", text_color=color.white, bgcolor=#089981, text_size=size.small, text_halign=text.align_right)
+    table.cell(vPanel, 0, 0, (panelOpen ? "▾ " : "▸ ") + "S/D REVERSAL _ATR", text_color=color.white, bgcolor=#2962ff, text_size=size.small, text_halign=text.align_left)
+    table.cell(vPanel, 1, 0, syminfo.ticker + "  " + timeframe.period + "m", text_color=color.white, bgcolor=#2962ff, text_size=size.small, text_halign=text.align_right)
     if not panelOpen
         for r = 1 to 7
             table.cell(vPanel, 0, r, "", bgcolor=color.new(color.black, 100))
@@ -567,8 +570,8 @@ if showPanel and atEdge and panelOpen
     pVal(3, arrowOf(vT3), colOf(vT3))
     pKey(4, "RSI " + str.tostring(rsiLen))
     pVal(4, str.tostring(rsiv, "#.0") + (rsiv >= 70 ? "  overbought" : rsiv <= 30 ? "  oversold" : ""), rsiv >= 70 ? #f23645 : rsiv <= 30 ? #089981 : #d1d4dc)
-    pKey(5, "Trend filter")
-    pVal(5, trendMode == "off" ? "off - zone sets direction" : trendMode + " " + arrowOf(trend), trendMode == "off" ? #787b86 : colOf(trend))
+    pKey(5, "Divergence")
+    pVal(5, bullDiv ? "bullish" : bearDiv ? "bearish" : "none", bullDiv ? #089981 : bearDiv ? #f23645 : #787b86)
     pKey(6, "Zones live/cand")
     pVal(6, str.tostring(liveZones()) + " / " + str.tostring(array.size(zCand)) + "   need " + str.tostring(needTF) + "/4", #d1d4dc)
     pKey(7, "Position")
@@ -577,15 +580,16 @@ if showPanel and atEdge and panelOpen
 
 // ---- entry checklist, as a hover tooltip on the entry marker ----
 if showCheck and not na(sigBar) and sigBar == bar_index
-    string tip = "SupplyDemandTrendContinuation — why this entry" +
+    string tip = "SupplyDemandTrendReversal_ATR — why this entry" +
          "\n\nZone         " + timeframe.period + "m " + (sigLong ? "demand" : "supply") + "  " +
               str.tostring(sigBot, format.mintick) + " – " + str.tostring(sigTop, format.mintick) +
+         "\nZone rule    leg-out >= " + str.tostring(aLegAtr) + "x ATR, leg-in >= " + str.tostring(aLegRatio) + "x leg-out" +
          "\nConfluence   " + str.tostring(sigConf) + " of 4 timeframes agree (need " + str.tostring(needTF) + ")" +
          "\nImbalance    " + (useFVG ? "3-bar FVG required, present" : "not required") +
          "\nStructure    " + (useBOS ? "break of structure required, present" : "not required") +
-         "\nTrend filter " + (trendMode == "off" ? "off - the zone sets direction" : trendMode + " on " + trendTF + ", " + arrowOf(sigTrend)) +
-         "\nRSI gate     " + str.tostring(sigRsi, "#.0") + (sigLong ? "  below " + str.tostring(rsiLongMax) : "  above " + str.tostring(rsiShortMin)) +
-         "\nTrigger      rejection candle on first touch (wick, engulfing or break of prior bar)" +
+         "\nDivergence   " + (useDiv ? "RSI divergence required, present" : "not required") +
+         "\nSequence     arrival → rejection " + str.tostring(rejAtr) + " ATR beyond proximal → retest" +
+         "\nRSI(" + str.tostring(rsiLen) + ")      " + str.tostring(rsiv, "#.0") +
          "\nTrend        " + vTf1 + " " + arrowOf(vT1) + "   " + vTf2 + " " + arrowOf(vT2) + "   " + vTf3 + " " + arrowOf(vT3) +
          "\nPremarket    " + (na(pmH) ? "n/a" : str.tostring(pmL, format.mintick) + " – " + str.tostring(pmH, format.mintick)) +
          "\nPrior day    " + str.tostring(pdL, format.mintick) + " – " + str.tostring(pdH, format.mintick) +

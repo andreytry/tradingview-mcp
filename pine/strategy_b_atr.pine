@@ -1,5 +1,12 @@
 //@version=5
-// SUPPLY / DEMAND TREND CONTINUATION   (was "Strategy B - Trend Continuation")
+// SUPPLY / DEMAND TREND CONTINUATION  _ATR
+// Same entries, exits, confluence gate, risk model and alerts as
+// SupplyDemandTrendContinuation. The only difference is how a zone is found:
+// this build uses the detection rules from "Supply Demand Zones Trading
+// Strategy v5" - leg-out body measured against ATR, a base of small candles
+// each constrained by wick ratio and relative size, and a leg-in candle that
+// must retain a minimum fraction of the leg-out body. That script plots
+// nothing, so its zones cannot be read across scripts; the rules are ported.
 //
 // Follow the established move. Supply/demand zones are built independently on 5m, 15m,
 // 1h and 4h. A zone survives only if at least 3 of those 4 hold an overlapping,
@@ -8,7 +15,7 @@
 // Sequence, all on the 15m chart: price retraces into a qualifying zone, RSI is not
 // overextended, a rejection candle prints, enter at its close. No break, no retest -
 // that is Strategy A's job, and it is what stops the two colliding on one zone.
-strategy("SupplyDemandTrendContinuation", overlay=true,
+strategy("SupplyDemandTrendContinuation_ATR", overlay=true,
      max_boxes_count=500, max_labels_count=500, max_lines_count=100,
      initial_capital=10000, default_qty_type=strategy.fixed, default_qty_value=1,
      pyramiding=0, commission_type=strategy.commission.cash_per_order, commission_value=0.5,
@@ -31,6 +38,17 @@ baseMax   = input.int(3,    "Max base candles", group=grpZ)
 baseRatio = input.float(0.5,"Base body <= x next body", step=0.05, group=grpZ)
 swingLR   = input.int(2,    "Swing pivot left/right", group=grpZ)
 maxZones  = input.int(2000,  "Max live zones per timeframe", group=grpZ)
+
+// ---- zone detection, ported from "Supply Demand Zones Trading Strategy v5" ----
+// Declared here, with the other zone-construction inputs, because detect() below reads
+// them: Pine requires declaration before use. These are new scripts with no armed alerts,
+// so there is no input snapshot to preserve and the ordering is free.
+grpA = "Zone detection (ATR rules)"
+aLegAtr   = input.float(0.5,  "Leg-out body >= x ATR",         step=0.05, group=grpA)
+aLegRatio = input.float(0.25, "Leg-in body >= x leg-out body", step=0.05, group=grpA)
+aMaxSmall = input.int(10,     "Max base candles",              minval=1,  group=grpA)
+aWickRat  = input.float(10.0, "Base candle max wick / body",   step=0.5,  group=grpA)
+aSizeRat  = input.float(0.5,  "Base candle body <= x leg-out", step=0.05, group=grpA)
 
 grpC = "Confluence"
 needTF    = input.int(1, "Timeframes that must agree (of 4)", minval=1, maxval=4, group=grpC)
@@ -84,15 +102,6 @@ bodyOf(float o, float c) => math.abs(c - o)
 // ─────────── detection, evaluated inside each timeframe's own context ───────────
 detect() =>
     float a  = ta.atr(atrLen)
-    float ph = ta.pivothigh(high, swingLR, swingLR)
-    float pl = ta.pivotlow(low, swingLR, swingLR)
-    var float lastPH = na
-    var float lastPL = na
-    if not na(ph)
-        lastPH := ph
-    if not na(pl)
-        lastPL := pl
-
     float lo   = bodyOf(open, close)
     bool  bull = close > open
     float zt = na
@@ -100,27 +109,57 @@ detect() =>
     bool  dem = false
     bool  ok  = false
 
-    if not na(a) and a > 0 and lo >= legAtr * a and close != open
-        // base: up to baseMax candles, each body <= baseRatio x the body that follows it
-        // each base candle is measured against the LEG-OUT body, not the candle after it.
-        // Chaining it makes candle 2 need <=25% and candle 3 <=12.5%, which all but
-        // removes multi-candle bases and builds zones that are far too narrow.
-        int n = 0
-        while n < baseMax and bodyOf(open[1 + n], close[1 + n]) <= lo * baseRatio
-            n += 1
-        if n >= 1
-            bool bos = not useBOS or (bull ? (not na(lastPH) and close > lastPH) : (not na(lastPL) and close < lastPL))
+    // Leg-out: body must clear aLegAtr x ATR. This replaces the legAtr gate of the
+    // sibling script; everything downstream (confluence, entry, risk) is unchanged.
+    if not na(a) and a > 0 and lo >= aLegAtr * a and close != open
+        int   small = 0
+        int   idx   = 1
+        bool  found = false
+        int   legIn = -1
+        // Walk back over base candles. Each must be small relative to the leg-out body
+        // and not be mostly wick. The first candle that still carries aLegRatio of the
+        // leg-out body is the leg-in that anchors the zone.
+        while idx <= aMaxSmall and idx < 300
+            float sO = open[idx]
+            float sC = close[idx]
+            float sH = high[idx]
+            float sL = low[idx]
+            if na(sO) or na(sC) or na(sH) or na(sL)
+                break
+            float sBody = bodyOf(sO, sC)
+            if small >= 1 and sBody >= lo * aLegRatio
+                found := true
+                legIn := idx
+                break
+            float upW = sH - math.max(sO, sC)
+            float dnW = math.min(sO, sC) - sL
+            bool wickOk = sBody > 0 and math.max(upW, dnW) <= sBody * aWickRat
+            bool sizeOk = sBody <= lo * aSizeRat
+            if wickOk and sizeOk
+                small += 1
+                idx   += 1
+            else
+                break
+        if not found and small >= 1
+            found := true
+            legIn := math.min(idx, 299)
+        if found and legIn > 0 and small >= 1
+            // Direction comes from the leg-out and leg-in colours, exactly as the
+            // four patterns are classified in the source script.
+            bool legBull = close[legIn] > open[legIn]
+            bool isDemand = bull
+            bool bos = not useBOS or (bull ? close > ta.highest(high, 20)[1] : close < ta.lowest(low, 20)[1])
             bool fvg = not useFVG or (bull ? (high[2] < low) : (low[2] > high))
             if bos and fvg
                 float t = high[1]
                 float b = low[1]
-                for i = 1 to n
+                for i = 1 to small
                     t := math.max(t, high[i])
                     b := math.min(b, low[i])
                 if t > b
                     zt  := t
                     zb  := b
-                    dem := bull
+                    dem := isDemand
                     ok  := true
     [ok, zt, zb, dem]
 
@@ -393,7 +432,7 @@ if barstate.isconfirmed and strategy.position_size == 0 and not na(atrCt) and ar
                 if sendAlerts
                     sigId := syminfo.ticker + "-" + str.tostring(time) + "-" + (z.dem ? "L" : "S")
                     alert('{"v":1' +
-                         ',"strategy":"continuation-b-v2"' +
+                         ',"strategy":"continuation-b-atr"' +
                          ',"event":"OPEN"' +
                          ',"id":"' + sigId + '"' +
                          ',"symbol":"' + syminfo.ticker + '"' +
@@ -413,7 +452,7 @@ if sendAlerts and ta.change(strategy.closedtrades) > 0 and not na(sigId)
     float pnl = strategy.closedtrades.profit(strategy.closedtrades - 1)
     float exitPx = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
     alert('{"v":1' +
-         ',"strategy":"continuation-b-v2"' +
+         ',"strategy":"continuation-b-atr"' +
          ',"event":"CLOSE"' +
          ',"signalId":"' + sigId + '"' +
          ',"symbol":"' + syminfo.ticker + '"' +
